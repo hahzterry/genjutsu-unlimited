@@ -130,7 +130,7 @@ class Job:
 
 JOBS: dict[str, Job] = {}
 WORK_QUEUE: asyncio.Queue = asyncio.Queue()
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))  # bulletproof: max 4 workers
 
 
 async def push_event(job: Job, event: str, data) -> None:
@@ -249,7 +249,7 @@ async def health():
 @app.get("/proxies")
 async def get_proxies():
     from creator import PROXY_POOL
-    return {"count": PROXY_POOL.size, "proxies": [f"{p.split('@')[0]}@***" for p in PROXY_POOL.proxies]}
+    return PROXY_POOL.status()
 
 
 @app.post("/proxies")
@@ -262,11 +262,26 @@ async def set_proxies(request: Request):
     new_proxies = body.get("proxies", [])
     if not isinstance(new_proxies, list):
         raise HTTPException(400, "proxies must be a list of strings")
-    # Update the runtime proxy pool
     from creator import PROXY_POOL
     PROXY_POOL.update_proxies(new_proxies)
     log.info(f"proxy pool updated: {len(new_proxies)} proxies")
-    return {"count": len(new_proxies), "status": "updated"}
+    return {"count": PROXY_POOL.size, "status": "updated"}
+
+
+@app.get("/stats")
+async def stats():
+    """Account + proxy statistics."""
+    from database import list_accounts
+    from creator import PROXY_POOL
+    accounts = await list_accounts()
+    active = sum(1 for a in accounts if a.get("status") == "active")
+    banned = sum(1 for a in accounts if a.get("status") == "banned")
+    exhausted = sum(1 for a in accounts if a.get("credits", 0) == 0)
+    return {
+        "accounts": {"total": len(accounts), "active": active, "banned": banned, "exhausted": exhausted},
+        "proxies": PROXY_POOL.status(),
+        "workers": MAX_WORKERS,
+    }
 
 
 @app.post("/generate")

@@ -23,6 +23,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext, Locator
 from temp_mail import TempMail
 from database import save_account, get_account_with_credits, mark_used, mark_banned
+from proxy_manager import ProxyManager, load_proxy_list, COOLDOWN_SECONDS
 
 log = logging.getLogger("creator")
 HIGGS = "https://higgsfield.ai"
@@ -83,7 +84,11 @@ class ProxyPool:
         self._failures.clear()
 
 
-PROXY_POOL = ProxyPool(PROXY_LIST)
+PROXY_POOL = ProxyManager(load_proxy_list())
+
+# Global delay between new account creations (90-180s)
+GLOBAL_ACCOUNT_DELAY = float(os.getenv("GLOBAL_ACCOUNT_DELAY", "90"))
+_last_account_time = 0.0
 
 
 # ===== FingerprintRandomizer — maximum spoofing per session =====
@@ -195,6 +200,17 @@ async def human_delay(lo=None, hi=None):
 
 async def pick_proxy() -> Optional[str]:
     return await PROXY_POOL.next()
+
+async def global_account_delay():
+    """Global delay of 90-180s between starting new account creations."""
+    global _last_account_time
+    if GLOBAL_ACCOUNT_DELAY > 0:
+        elapsed = time.time() - _last_account_time
+        if elapsed < GLOBAL_ACCOUNT_DELAY:
+            wait = GLOBAL_ACCOUNT_DELAY - elapsed + random.uniform(0, 90)
+            log.info(f"global account delay: sleeping {wait:.0f}s")
+            await asyncio.sleep(wait)
+    _last_account_time = time.time()
 
 def random_password() -> str:
     return "".join(random.choices(_string.ascii_letters + _string.digits + "!@#$%", k=16))
@@ -325,6 +341,30 @@ class HiggsfieldCreator:
         except Exception:
             pass
 
+    async def _detect_cloudflare(self) -> bool:
+        """Detect Cloudflare challenge/turnstile pages."""
+        cf_sels = [
+            'text="Checking your browser"',
+            'text="Just a moment"',
+            '#cf-challenge', '.cf-turnstile',
+            'iframe[src*="challenges.cloudflare.com"]',
+            '#challenge-form', '#cf-please-wait',
+        ]
+        for sel in cf_sels:
+            try:
+                if await self.page.locator(sel).first.is_visible(timeout=1000):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _human_scroll(self, scrolls=3):
+        """Simulate human scrolling — scroll down and up randomly."""
+        for _ in range(scrolls):
+            await self.page.mouse.wheel(0, random.randint(100, 400))
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+
     async def run(self, reference_path, prompt, image_paths: list[Path] | None = None) -> Path:
         # Gap F: overall timeout wraps the entire retry loop
         self._image_paths = image_paths or []
@@ -342,23 +382,26 @@ class HiggsfieldCreator:
             try:
                 await self._log("info", f"attempt {attempt}/3")
                 result = await self._attempt(reference_path, prompt)
-                # Reset proxy failure count on success
                 if self.proxy:
-                    await PROXY_POOL.reset(self.proxy)
+                    await PROXY_POOL.reset_failure(self.proxy)
                 return result
             except Exception as e:
                 last_err = e
                 await self._log("warn", f"attempt {attempt} failed: {e}")
-                # Record proxy failure so the pool can skip dead proxies
+                # Record proxy failure + release with backoff
                 if self.proxy and not self.reused_account:
                     await PROXY_POOL.record_failure(self.proxy)
+                    await self._log("info", f"proxy {self.proxy.split('@')[0]}@*** marked failed, will retry with different proxy")
                 if self.page: await self._shot(f"fail_attempt{attempt}")
-                await self._cleanup(); await asyncio.sleep(3)
+                await self._cleanup()
+                # Backoff: exponential delay between retries
+                backoff = min(60 * (2 ** (attempt - 1)), 180)
+                await self._log("info", f"backoff: sleeping {backoff}s before retry")
+                await asyncio.sleep(backoff)
         await self._cleanup()
         raise RuntimeError(f"all 3 attempts failed: {last_err}")
 
     async def _attempt(self, reference_path, prompt) -> Path:
-        # Gap G + ProxyPool: proxy chosen from rotating pool, bound to account for its lifetime
         acct = await get_account_with_credits()
         if acct:
             self.email = acct["email"]; self.password = acct["password"]
@@ -366,11 +409,16 @@ class HiggsfieldCreator:
             self.reused_account = True
             await self._log("info", f"reusing account {self.email} (proxy={self.proxy or 'none'})")
         else:
-            self.proxy = await pick_proxy()  # fresh IP every new account
+            await global_account_delay()  # 90-180s between new account creations
+            self.proxy = await pick_proxy()
             self.reused_account = False
 
-        await self._log("info", f"launching browser (proxy={'yes' if self.proxy else 'no'}, pool={PROXY_POOL.size})")
-        await self._log("info", f"fingerprint: ua={self.fp.ua[:40]}... tz={self.fp.timezone} res={self.fp.resolution['width']}x{self.fp.resolution['height']}")
+        # Get proxy metadata for timezone matching
+        proxy_info = PROXY_POOL.get_info(self.proxy) if self.proxy else None
+        proxy_tz = proxy_info.timezone if proxy_info else "America/New_York"
+        proxy_udd = proxy_info.user_data_dir if proxy_info else None
+
+        await self._log("info", f"launching browser (proxy={'yes' if self.proxy else 'no'}, pool={PROXY_POOL.size}, tz={proxy_tz})")
         self._pw = await async_playwright().start()
         launch_args = {"headless": HEADLESS,
                        "args": ["--disable-blink-features=AutomationControlled"]}
@@ -379,8 +427,8 @@ class HiggsfieldCreator:
         self.ctx = await self.browser.new_context(
             viewport=self.fp.resolution,
             user_agent=self.fp.ua,
-            locale=self.fp.languages[0],
-            timezone_id=self.fp.timezone,
+            locale="en-US",
+            timezone_id=proxy_tz,
             screen={"width": self.fp.resolution["width"], "height": self.fp.resolution["height"]})
         await self.ctx.add_init_script(self.fp.stealth_script())
         self.page = await self.ctx.new_page()
@@ -398,7 +446,11 @@ class HiggsfieldCreator:
     async def _create_account(self):
         self.email = await self.mail.create()
         await self._log("info", f"temp inbox ready: {self.email}")
-        await self.page.goto(SIGNUP, wait_until="domcontentloaded", timeout=60000); await human_delay()
+        await self.page.goto(SIGNUP, wait_until="domcontentloaded", timeout=90000); await human_delay()
+        # Cloudflare detection
+        if await self._detect_cloudflare():
+            await self._shot("cloudflare_signup")
+            raise RuntimeError("Cloudflare challenge on signup — need a better proxy")
         if await detect_captcha(self.page):
             await self._shot("captcha_signup")
             raise RuntimeError("captcha on signup - needs a solver or manual solve")
@@ -432,6 +484,9 @@ class HiggsfieldCreator:
         # Gap G: bind proxy used at signup to this account
         await save_account(self.email, self.password, credits=1, proxy=self.proxy)
         await self._log("ok", f"account saved (proxy bound: {self.proxy or 'none'})")
+        # Mark proxy as used (triggers 45 min cooldown)
+        if self.proxy:
+            await PROXY_POOL.mark_used(self.proxy)
 
     async def _login(self):
         await self.page.goto(LOGIN, wait_until="domcontentloaded", timeout=60000); await human_delay()
@@ -464,7 +519,8 @@ class HiggsfieldCreator:
         if await detect_captcha(self.page):
             await self._shot("captcha_create")
             raise RuntimeError("captcha on create page - needs a solver or manual solve")
-        await click_any(self.page, ['button:has-text("Settings")', '[aria-label*="Settings" i]'], timeout=4000)
+        # Human behavior: scroll the page before interacting
+        await self._human_scroll(scrolls=random.randint(2, 4))
         await self._log("info", "selecting Model: Higgsfield Genjutsu")
         await select_menu_option(self.page, "Model", "Higgsfield Genjutsu", self._log)
         await human_delay()
@@ -474,6 +530,9 @@ class HiggsfieldCreator:
         await self._log("info", "ensuring 'Use free gens' is ON")
         await ensure_toggle_on(self.page, "Use free gens", self._log)
         await human_delay()
+        # Human behavior: wait 15-40s before uploading reference (like a human reading the page)
+        await self._log("info", "waiting before upload (human simulation)...")
+        await asyncio.sleep(random.uniform(15, 40))
         # Upload reference VIDEO (required) — find the video file input
         file_inputs = self.page.locator('input[type="file"]')
         count = await file_inputs.count()
