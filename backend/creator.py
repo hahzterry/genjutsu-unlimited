@@ -36,49 +36,34 @@ PROXY_LIST = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.str
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "300"))
 
-# --- Anti-detection config (v4.0) ---
-MIN_ACTION_DELAY = float(os.getenv("MIN_ACTION_DELAY", "30"))
-MAX_ACTION_DELAY = float(os.getenv("MAX_ACTION_DELAY", "90"))
-ACCOUNT_COOLDOWN = float(os.getenv("ACCOUNT_COOLDOWN", "300"))
-MAX_ACCOUNTS_PER_IP_PER_HOUR = int(os.getenv("MAX_ACCOUNTS_PER_IP_PER_HOUR", "2"))
-STEALTH_MODE = os.getenv("STEALTH_MODE", "true").lower() == "true"
+# --- Anti-detection config (v4.1 — mass mode, no throttling) ---
+# Natural human-like delays (fast but not robotic)
+MIN_ACTION_DELAY = float(os.getenv("MIN_ACTION_DELAY", "0.5"))
+MAX_ACTION_DELAY = float(os.getenv("MAX_ACTION_DELAY", "2.0"))
+# No cooldown, no per-IP limit — mass account creation
+STEALTH_MODE = False  # always fast mode
 
 
 class ProxyPool:
-    """Rotates proxies round-robin. Tracks failures + per-IP account creation rate.
-    Never exceeds MAX_ACCOUNTS_PER_IP_PER_HOUR accounts from the same proxy.
+    """Rotates proxies round-robin so every new account gets a fresh IP.
+    Tracks failures and skips dead proxies. No per-IP rate limit — mass mode.
     """
-    def __init__(self, proxies: list[str], max_per_ip_per_hour: int = 2):
+    def __init__(self, proxies: list[str]):
         self.proxies = proxies
         self._idx = 0
         self._failures: dict[str, int] = {}
-        self._account_times: dict[str, list[float]] = {}
-        self._max_per_ip = max_per_ip_per_hour
         self._lock = asyncio.Lock()
 
     async def next(self) -> Optional[str]:
         if not self.proxies:
             return None
         async with self._lock:
-            now = time.time()
             for _ in range(len(self.proxies)):
                 p = self.proxies[self._idx % len(self.proxies)]
                 self._idx += 1
-                if self._failures.get(p, 0) >= 3:
-                    continue
-                times = [t for t in self._account_times.get(p, []) if now - t < 3600]
-                self._account_times[p] = times
-                if len(times) >= self._max_per_ip:
-                    continue
-                return p
-            available = [p for p in self.proxies if self._failures.get(p, 0) < 3]
-            if available:
-                return min(available, key=lambda p: len(self._account_times.get(p, [])))
+                if self._failures.get(p, 0) < 3:
+                    return p
             return min(self.proxies, key=lambda p: self._failures.get(p, 0))
-
-    async def record_account_creation(self, proxy: str):
-        async with self._lock:
-            self._account_times.setdefault(proxy, []).append(time.time())
 
     async def record_failure(self, proxy: str):
         async with self._lock:
@@ -96,10 +81,9 @@ class ProxyPool:
         self.proxies = new_proxies
         self._idx = 0
         self._failures.clear()
-        self._account_times.clear()
 
 
-PROXY_POOL = ProxyPool(PROXY_LIST, MAX_ACCOUNTS_PER_IP_PER_HOUR)
+PROXY_POOL = ProxyPool(PROXY_LIST)
 
 
 # ===== FingerprintRandomizer — maximum spoofing per session =====
@@ -203,20 +187,11 @@ class HumanInput:
 
 
 async def human_delay(lo=None, hi=None):
-    """Human-like delay. Long (30-90s) in stealth mode, fast (0.3-1s) in stress test."""
-    if not STEALTH_MODE:
-        await asyncio.sleep(random.uniform(0.3, 1.0))
-    elif lo is not None and hi is not None:
+    """Fast natural human-like delay (0.5-2s). Not robotic, not throttled."""
+    if lo is not None and hi is not None:
         await asyncio.sleep(random.uniform(lo, hi))
     else:
         await asyncio.sleep(random.uniform(MIN_ACTION_DELAY, MAX_ACTION_DELAY))
-
-async def account_cooldown():
-    """Delay between account creations (5-15 min in stealth, near-zero in stress)."""
-    if STEALTH_MODE:
-        delay = random.uniform(ACCOUNT_COOLDOWN, ACCOUNT_COOLDOWN * 3)
-        log.info(f"account cooldown: sleeping {delay:.0f}s")
-        await asyncio.sleep(delay)
 
 async def pick_proxy() -> Optional[str]:
     return await PROXY_POOL.next()
@@ -411,10 +386,7 @@ class HiggsfieldCreator:
         self.page = await self.ctx.new_page()
 
         if not self.reused_account:
-            await account_cooldown()  # v4.0: 5-15 min between account creations
             await self._create_account()
-            if self.proxy:
-                await PROXY_POOL.record_account_creation(self.proxy)  # v4.0: per-IP rate limit
         await self._login()
         await self._run_genjutsu(reference_path, prompt)
         # Bug A fix: mark credit consumed RIGHT AFTER generation succeeds,
