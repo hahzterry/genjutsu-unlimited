@@ -262,9 +262,7 @@ async def set_proxies(request: Request):
         raise HTTPException(400, "proxies must be a list of strings")
     # Update the runtime proxy pool
     from creator import PROXY_POOL
-    PROXY_POOL.proxies = new_proxies
-    PROXY_POOL._idx = 0
-    PROXY_POOL._failures.clear()
+    PROXY_POOL.update_proxies(new_proxies)
     log.info(f"proxy pool updated: {len(new_proxies)} proxies")
     return {"count": len(new_proxies), "status": "updated"}
 

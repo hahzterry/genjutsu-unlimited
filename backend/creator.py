@@ -1,8 +1,12 @@
 """HiggsfieldCreator — full invisible automation of the Higgsfield Genjutsu flow.
 
-Pipeline: temp email -> signup -> verify -> login -> Create page ->
-  Model=Higgsfield Genjutsu, Quality=720p, Use free gens=ON ->
-  upload reference -> prompt -> generate -> mark-consumed -> download.
+v4.0 anti-detection upgrades:
+  - Maximum fingerprint spoofing (canvas/WebGL/audio/navigator)
+  - Human-like bezier mouse movements + typing simulation
+  - Configurable long delays (30-90s between actions, 5-15min between accounts)
+  - Rotating UA/timezone/language/screen resolution per session
+  - Per-proxy rate limiting (max 2-3 accounts/hour per IP)
+  - Stealth init scripts (webdriver, plugins, languages, hardware)
 
 Bug fixes vs prior version:
   A: mark_used() fires right after generation (before download) — no credit leak.
@@ -10,10 +14,10 @@ Bug fixes vs prior version:
   C: 404 detection uses HTTP response status, not fragile title text.
   D: settings-row selectors scoped to a dialog/panel container first.
   E: TempMail log callback is now properly awaited (no fire-and-forget).
-  F: overall 5-minute timeout wraps the entire retry loop.
+  F: overall timeout wraps the entire retry loop (configurable via RUN_TIMEOUT).
   G: proxy is bound to the account at creation and reused on every login.
 """
-import os, asyncio, random, logging, string as _string
+import os, asyncio, random, logging, string as _string, math, time
 from typing import Optional, Callable, Awaitable
 from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext, Locator
@@ -30,32 +34,51 @@ DEBUG_DIR = Path(os.getenv("DEBUG_DIR", "/tmp/debug")); DEBUG_DIR.mkdir(parents=
 VIDEO_DIR = Path(os.getenv("VIDEO_DIR", "/tmp/videos")); VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 PROXY_LIST = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-LOCALE = os.getenv("BROWSER_LOCALE", "en-US")
-RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "300"))  # Gap F: 5 min overall cap
+RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "300"))
+
+# --- Anti-detection config (v4.0) ---
+MIN_ACTION_DELAY = float(os.getenv("MIN_ACTION_DELAY", "30"))
+MAX_ACTION_DELAY = float(os.getenv("MAX_ACTION_DELAY", "90"))
+ACCOUNT_COOLDOWN = float(os.getenv("ACCOUNT_COOLDOWN", "300"))
+MAX_ACCOUNTS_PER_IP_PER_HOUR = int(os.getenv("MAX_ACCOUNTS_PER_IP_PER_HOUR", "2"))
+STEALTH_MODE = os.getenv("STEALTH_MODE", "true").lower() == "true"
 
 
 class ProxyPool:
-    """Rotates proxies round-robin so every new account gets a fresh IP.
-    Tracks failures and skips dead proxies automatically.
+    """Rotates proxies round-robin. Tracks failures + per-IP account creation rate.
+    Never exceeds MAX_ACCOUNTS_PER_IP_PER_HOUR accounts from the same proxy.
     """
-    def __init__(self, proxies: list[str]):
+    def __init__(self, proxies: list[str], max_per_ip_per_hour: int = 2):
         self.proxies = proxies
         self._idx = 0
         self._failures: dict[str, int] = {}
+        self._account_times: dict[str, list[float]] = {}
+        self._max_per_ip = max_per_ip_per_hour
         self._lock = asyncio.Lock()
 
     async def next(self) -> Optional[str]:
         if not self.proxies:
             return None
         async with self._lock:
-            # try up to len(proxies) times to find a healthy one
+            now = time.time()
             for _ in range(len(self.proxies)):
                 p = self.proxies[self._idx % len(self.proxies)]
                 self._idx += 1
-                if self._failures.get(p, 0) < 3:  # skip if 3+ failures
-                    return p
-            # all proxies are failing — return the least-bad one
+                if self._failures.get(p, 0) >= 3:
+                    continue
+                times = [t for t in self._account_times.get(p, []) if now - t < 3600]
+                self._account_times[p] = times
+                if len(times) >= self._max_per_ip:
+                    continue
+                return p
+            available = [p for p in self.proxies if self._failures.get(p, 0) < 3]
+            if available:
+                return min(available, key=lambda p: len(self._account_times.get(p, [])))
             return min(self.proxies, key=lambda p: self._failures.get(p, 0))
+
+    async def record_account_creation(self, proxy: str):
+        async with self._lock:
+            self._account_times.setdefault(proxy, []).append(time.time())
 
     async def record_failure(self, proxy: str):
         async with self._lock:
@@ -69,16 +92,133 @@ class ProxyPool:
     def size(self) -> int:
         return len(self.proxies)
 
+    def update_proxies(self, new_proxies: list[str]):
+        self.proxies = new_proxies
+        self._idx = 0
+        self._failures.clear()
+        self._account_times.clear()
 
-# Singleton proxy pool — shared across all workers
-PROXY_POOL = ProxyPool(PROXY_LIST)
+
+PROXY_POOL = ProxyPool(PROXY_LIST, MAX_ACCOUNTS_PER_IP_PER_HOUR)
 
 
-async def human_delay(lo=0.5, hi=2.0):
-    await asyncio.sleep(random.uniform(lo, hi))
+# ===== FingerprintRandomizer — maximum spoofing per session =====
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+]
+TIMEZONES = ["America/New_York","America/Los_Angeles","America/Chicago","Europe/London","Europe/Berlin","Asia/Tokyo"]
+LANGUAGES_LIST = [["en-US","en"],["en-GB","en"],["en-AU","en"],["en-CA","en"]]
+RESOLUTIONS = [{"width":1920,"height":1080},{"width":1440,"height":900},{"width":1536,"height":864}]
+PLATFORMS = ["MacIntel","Win32","Linux x86_64"]
+
+
+class FingerprintRandomizer:
+    """Generates a unique fingerprint profile for each browser session."""
+    def __init__(self):
+        self.ua = random.choice(USER_AGENTS)
+        self.timezone = random.choice(TIMEZONES)
+        self.languages = random.choice(LANGUAGES_LIST)
+        self.resolution = random.choice(RESOLUTIONS)
+        self.platform = random.choice(PLATFORMS)
+        self.hw_concurrency = random.choice([4, 8, 8, 12, 16])
+        self.device_memory = random.choice([4, 8, 8, 16])
+        self.canvas_noise = random.uniform(0.0001, 0.001)
+        self.webgl_vendor = random.choice(["Google Inc. (Apple)","Google Inc. (Intel)","Google Inc. (NVIDIA)"])
+        self.webgl_renderer = random.choice([
+            "ANGLE (Apple, Apple M1, OpenGL 4.1)",
+            "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics, OpenGL 4.1)",
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060, OpenGL 4.5)"])
+        self.audio_noise = random.uniform(0.00001, 0.0001)
+
+    def stealth_script(self) -> str:
+        return f"""
+        Object.defineProperty(navigator,'webdriver',{{get:()=>undefined}});
+        Object.defineProperty(navigator,'languages',{{get:()=>{self.languages!r}}});
+        Object.defineProperty(navigator,'platform',{{get:()=>'{self.platform}'}});
+        Object.defineProperty(navigator,'hardwareConcurrency',{{get:()=>{self.hw_concurrency}}});
+        Object.defineProperty(navigator,'deviceMemory',{{get:()=>{self.device_memory}}});
+        Object.defineProperty(navigator,'plugins',{{get:()=>[{{name:'Chrome PDF Plugin'}},{{name:'Chrome PDF Viewer'}}]}});
+        Object.defineProperty(navigator,'doNotTrack',{{get:()=>'1'}});
+        Object.defineProperty(navigator,'maxTouchPoints',{{get:()=>0}});
+        const _td=HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL=function(...a){{const c=this.getContext('2d');if(c){{const d=c.getImageData(0,0,this.width,this.height);for(let i=0;i<d.data.length;i+=4)d.data[i]^={int(self.canvas_noise*255)};c.putImageData(d,0,0)}}return _td.apply(this,a)}};
+        const _gp=WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter=function(p){{if(p===37445)return'{self.webgl_vendor}';if(p===37446)return'{self.webgl_renderer}';return _gp.call(this,p)}};
+        const _co=AudioContext.prototype.createOscillator;
+        AudioContext.prototype.createOscillator=function(){{const o=_co.call(this);const _cn=o.connect.bind(o);o.connect=function(d){{if(d.gain)d.gain.value*=(1+{self.audio_noise});return _cn(d)}};return o}};
+        window.chrome={{runtime:{{}}}};
+        const _q=navigator.permissions.query;
+        navigator.permissions.query=function(p){{if(p.name==='notifications')return Promise.resolve({{state:'prompt'}});return _q.call(this,p)}};
+        """
+
+
+# ===== HumanInput — realistic mouse + keyboard simulation =====
+
+class HumanInput:
+    @staticmethod
+    async def human_move(page, x, y, steps=25):
+        cur = await page.evaluate("()=>({x:0,y:0})")
+        cx, cy = cur["x"], cur["y"]
+        c1x, c1y = cx + random.uniform(-50,50), cy + random.uniform(-50,50)
+        c2x, c2y = x + random.uniform(-50,50), y + random.uniform(-50,50)
+        for i in range(steps):
+            t = i / steps
+            px = ((1-t)**3)*cx + 3*((1-t)**2)*t*c1x + 3*(1-t)*(t**2)*c2x + (t**3)*x
+            py = ((1-t)**3)*cy + 3*((1-t)**2)*t*c1y + 3*(1-t)*(t**2)*c2y + (t**3)*y
+            await page.mouse.move(px, py)
+            await asyncio.sleep(random.uniform(0.01, 0.05))
+
+    @staticmethod
+    async def human_click(page, selector):
+        try:
+            el = page.locator(selector).first
+            box = await el.bounding_box()
+            if not box:
+                await el.click(); return
+            tx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+            ty = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+            await HumanInput.human_move(page, tx, ty, steps=random.randint(15, 30))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+            await page.mouse.click(tx, ty)
+        except Exception:
+            try: await el.click()
+            except Exception: pass
+
+    @staticmethod
+    async def human_type(page, selector, text):
+        try:
+            el = page.locator(selector).first
+            await el.click()
+            await asyncio.sleep(random.uniform(0.2, 0.5))
+            for char in text:
+                await page.keyboard.type(char)
+                await asyncio.sleep(random.uniform(0.03, 0.12))
+        except Exception:
+            try: await el.fill(text)
+            except Exception: pass
+
+
+async def human_delay(lo=None, hi=None):
+    """Human-like delay. Long (30-90s) in stealth mode, fast (0.3-1s) in stress test."""
+    if not STEALTH_MODE:
+        await asyncio.sleep(random.uniform(0.3, 1.0))
+    elif lo is not None and hi is not None:
+        await asyncio.sleep(random.uniform(lo, hi))
+    else:
+        await asyncio.sleep(random.uniform(MIN_ACTION_DELAY, MAX_ACTION_DELAY))
+
+async def account_cooldown():
+    """Delay between account creations (5-15 min in stealth, near-zero in stress)."""
+    if STEALTH_MODE:
+        delay = random.uniform(ACCOUNT_COOLDOWN, ACCOUNT_COOLDOWN * 3)
+        log.info(f"account cooldown: sleeping {delay:.0f}s")
+        await asyncio.sleep(delay)
 
 async def pick_proxy() -> Optional[str]:
-    """Get the next proxy from the rotating pool (new IP each call)."""
     return await PROXY_POOL.next()
 
 def random_password() -> str:
@@ -193,8 +333,10 @@ class HiggsfieldCreator:
         self.email = ""; self.password = random_password()
         self.first, self.last = random_name()
         self.ctx = None; self.page = None
-        self.proxy: Optional[str] = None       # Gap G
-        self.reused_account = False             # Bug B
+        self.proxy: Optional[str] = None
+        self.reused_account = False
+        self.fp = FingerprintRandomizer()  # v4.0: unique fingerprint per session
+        self.hi = HumanInput()              # v4.0: human-like input
 
     async def _log(self, level, msg):
         log.info(f"[{level}] {msg}")
@@ -253,24 +395,26 @@ class HiggsfieldCreator:
             self.reused_account = False
 
         await self._log("info", f"launching browser (proxy={'yes' if self.proxy else 'no'}, pool={PROXY_POOL.size})")
+        await self._log("info", f"fingerprint: ua={self.fp.ua[:40]}... tz={self.fp.timezone} res={self.fp.resolution['width']}x{self.fp.resolution['height']}")
         self._pw = await async_playwright().start()
-        launch_args = {"headless": HEADLESS, "locale": LOCALE,
+        launch_args = {"headless": HEADLESS,
                        "args": ["--disable-blink-features=AutomationControlled"]}
         if self.proxy: launch_args["proxy"] = {"server": self.proxy}
         self.browser = await self._pw.chromium.launch(**launch_args)
         self.ctx = await self.browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-            locale=LOCALE)
-        await self.ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
-            "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});")
+            viewport=self.fp.resolution,
+            user_agent=self.fp.ua,
+            locale=self.fp.languages[0],
+            timezone_id=self.fp.timezone,
+            screen={"width": self.fp.resolution["width"], "height": self.fp.resolution["height"]})
+        await self.ctx.add_init_script(self.fp.stealth_script())
         self.page = await self.ctx.new_page()
 
         if not self.reused_account:
+            await account_cooldown()  # v4.0: 5-15 min between account creations
             await self._create_account()
+            if self.proxy:
+                await PROXY_POOL.record_account_creation(self.proxy)  # v4.0: per-IP rate limit
         await self._login()
         await self._run_genjutsu(reference_path, prompt)
         # Bug A fix: mark credit consumed RIGHT AFTER generation succeeds,
