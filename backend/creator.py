@@ -398,7 +398,7 @@ class HiggsfieldCreator:
     async def _create_account(self):
         self.email = await self.mail.create()
         await self._log("info", f"temp inbox ready: {self.email}")
-        await self.page.goto(SIGNUP, wait_until="networkidle"); await human_delay()
+        await self.page.goto(SIGNUP, wait_until="domcontentloaded", timeout=60000); await human_delay()
         if await detect_captcha(self.page):
             await self._shot("captcha_signup")
             raise RuntimeError("captcha on signup - needs a solver or manual solve")
@@ -424,7 +424,7 @@ class HiggsfieldCreator:
         # Bug E fix: async callback, properly awaited inside TempMail.wait_for_link
         link = await self.mail.wait_for_link(log=lambda m: self._log("info", m))
         await self._log("ok", f"verification link: {link}")
-        await self.page.goto(link, wait_until="networkidle"); await human_delay()
+        await self.page.goto(link, wait_until="domcontentloaded", timeout=60000); await human_delay()
         if await detect_captcha(self.page):
             await self._shot("captcha_verify")
             raise RuntimeError("captcha on verification - needs a solver or manual solve")
@@ -434,7 +434,7 @@ class HiggsfieldCreator:
         await self._log("ok", f"account saved (proxy bound: {self.proxy or 'none'})")
 
     async def _login(self):
-        await self.page.goto(LOGIN, wait_until="networkidle"); await human_delay()
+        await self.page.goto(LOGIN, wait_until="domcontentloaded", timeout=60000); await human_delay()
         if await detect_captcha(self.page):
             await self._shot("captcha_login")
             raise RuntimeError("captcha on login - needs a solver or manual solve")
@@ -455,10 +455,10 @@ class HiggsfieldCreator:
 
     async def _run_genjutsu(self, reference_path, prompt):
         # Bug C fix: use HTTP response status for 404 detection
-        resp = await self.page.goto(CREATE, wait_until="networkidle")
+        resp = await self.page.goto(CREATE, wait_until="domcontentloaded", timeout=60000)
         if resp and resp.status >= 400:
             await self._log("info", f"/create returned {resp.status}, falling back to /genjutsu")
-            await self.page.goto(GENJUTSU, wait_until="networkidle")
+            await self.page.goto(GENJUTSU, wait_until="domcontentloaded", timeout=60000)
         await human_delay()
         await self._log("info", f"navigated to create interface ({self.page.url})")
         if await detect_captcha(self.page):

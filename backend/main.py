@@ -213,6 +213,8 @@ async def worker(name: str) -> None:
             log.exception("job failed")
             job.status = "error"
             job.error = str(e)
+            job.progress = 0
+            await push_event(job, "progress", "0")
             await push_event(job, "log", {"level": "err", "msg": str(e)})
             await push_event(job, "error", {"error": str(e)})
         finally:
