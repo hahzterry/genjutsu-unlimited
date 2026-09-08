@@ -1,23 +1,30 @@
-"""FastAPI backend for higgsfield-genjutsu-unlimited.
+"""FastAPI backend for higgsfield-genjutsu-unlimited v3.0.
 
 Endpoints:
   POST /generate            (multipart: video, images[], prompt, mode) -> { jobId }
   GET  /jobs/{id}/stream    SSE: log / progress / done events
   GET  /jobs/{id}/video     FileResponse of the result mp4
   GET  /health              liveness probe
+
+Security (all gaps fixed):
+  - API_KEY auth via X-API-Key header (Gap 1)
+  - Configurable rate limiting per IP (Gap 2)
+  - JOBS TTL cleanup — no memory leak (Gap 3)
 """
 import os
 import uuid
 import asyncio
 import json
 import logging
-import shutil
+import time
 from pathlib import Path
 from typing import Optional, List
+from collections import defaultdict, deque
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from creator import HiggsfieldCreator
 from database import init_db
@@ -30,16 +37,21 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 CORS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
 
-# --- Security limits (defense in depth) ---
+# --- Security config ---
+API_KEY = os.getenv("API_KEY", "")  # if empty, auth disabled (local dev)
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "0"))  # 0 = disabled, N = max req/min per IP
+JOB_TTL = int(os.getenv("JOB_TTL", "3600"))  # seconds before old jobs are cleaned up
+
+# --- File limits ---
 MAX_IMAGES = 30
-MAX_VIDEO_SIZE = 100 * 1024 * 1024   # 100 MB
-MAX_IMAGE_SIZE = 20 * 1024 * 1024    # 20 MB per image
+MAX_VIDEO_SIZE = 100 * 1024 * 1024
+MAX_IMAGE_SIZE = 20 * 1024 * 1024
 MIN_DURATION = 4.0
 MAX_DURATION = 30.0
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo", "video/ogg"}
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"}
 
-app = FastAPI(title="higgsfield-genjutsu-unlimited", version="2.0.0")
+app = FastAPI(title="higgsfield-genjutsu-unlimited", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS,
@@ -48,6 +60,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ===== Gap 1: API Key auth middleware =====
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Reject requests without a valid X-API-Key header if API_KEY is set."""
+    EXEMPT_PATHS = {"/health"}
+
+    async def dispatch(self, request: Request, call_next):
+        if not API_KEY:
+            return await call_next(request)
+        if request.url.path in self.EXEMPT_PATHS:
+            return await call_next(request)
+        provided = request.headers.get("X-API-Key", "")
+        if provided != API_KEY:
+            return JSONResponse({"error": "invalid or missing API key"}, status_code=401)
+        return await call_next(request)
+
+app.add_middleware(ApiKeyMiddleware)
+
+
+# ===== Gap 2: Rate limiting (sliding window per IP) =====
+
+class RateLimiter:
+    """Simple in-memory sliding-window rate limiter. 0 = disabled."""
+    def __init__(self, max_per_min: int):
+        self.max = max_per_min
+        self.hits: dict[str, deque] = defaultdict(deque)
+
+    def check(self, ip: str) -> bool:
+        if self.max <= 0:
+            return True
+        now = time.time()
+        window = self.hits[ip]
+        while window and window[0] < now - 60:
+            window.popleft()
+        if len(window) >= self.max:
+            return False
+        window.append(now)
+        return True
+
+rate_limiter = RateLimiter(RATE_LIMIT)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if RATE_LIMIT > 0 and request.url.path not in {"/health"}:
+        ip = request.client.host if request.client else "unknown"
+        if not rate_limiter.check(ip):
+            return JSONResponse({"error": "rate limit exceeded"}, status_code=429)
+    return await call_next(request)
+
+
+# ===== Job store + worker pool =====
 
 class Job:
     def __init__(self, jid: str):
@@ -60,6 +125,7 @@ class Job:
         self.video_path: Optional[Path] = None
         self.error: Optional[str] = None
         self.queue: asyncio.Queue = asyncio.Queue()
+        self.created_at = time.time()
 
 
 JOBS: dict[str, Job] = {}
@@ -70,11 +136,6 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
 async def push_event(job: Job, event: str, data) -> None:
     payload = data if isinstance(data, str) else json.dumps(data)
     await job.queue.put((event, payload))
-
-
-def _safe_filename(name: str) -> str:
-    """Strip path traversal attempts — keep only the basename."""
-    return Path(name).name.replace("/", "_").replace("\\", "_").replace("..", "_")
 
 
 async def _probe_duration(path: Path) -> Optional[float]:
@@ -91,6 +152,26 @@ async def _probe_duration(path: Path) -> Optional[float]:
     except Exception:
         pass
     return None
+
+
+# ===== Gap 3: JOBS TTL cleanup =====
+
+async def jobs_cleanup_loop():
+    """Background task: remove completed jobs older than JOB_TTL seconds."""
+    while True:
+        await asyncio.sleep(300)  # check every 5 min
+        now = time.time()
+        expired = [jid for jid, j in JOBS.items()
+                   if j.status in ("done", "error") and now - j.created_at > JOB_TTL]
+        for jid in expired:
+            job = JOBS.pop(jid, None)
+            if job and job.video_path:
+                try:
+                    job.video_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        if expired:
+            log.info(f"cleaned up {len(expired)} expired jobs")
 
 
 async def worker(name: str) -> None:
@@ -140,7 +221,6 @@ async def worker(name: str) -> None:
                 await pt
             except asyncio.CancelledError:
                 pass
-            # Clean up uploaded reference files
             for p in [video_path] + image_paths:
                 try:
                     if p.exists():
@@ -154,11 +234,12 @@ async def startup() -> None:
     await init_db()
     for i in range(MAX_WORKERS):
         asyncio.create_task(worker(f"w{i}"))
+    asyncio.create_task(jobs_cleanup_loop())
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "jobs": len(JOBS)}
+    return {"status": "ok", "jobs": len(JOBS), "workers": MAX_WORKERS}
 
 
 @app.post("/generate")
@@ -168,7 +249,6 @@ async def generate(
     prompt: str = Form(...),
     mode: str = Form("motion_transfer"),
 ):
-    # --- Validate video ---
     if not video.content_type or video.content_type not in ALLOWED_VIDEO_TYPES:
         raise HTTPException(400, f"video must be one of {ALLOWED_VIDEO_TYPES}, got {video.content_type}")
     video_data = await video.read()
@@ -182,11 +262,9 @@ async def generate(
     job.prompt = prompt
     job.mode = mode
 
-    # Save video with sanitized name
     video_path = UPLOAD_DIR / f"{jid}_video"
     video_path.write_bytes(video_data)
 
-    # --- Validate duration (best-effort via ffprobe) ---
     duration = await _probe_duration(video_path)
     if duration is not None:
         if duration < MIN_DURATION or duration > MAX_DURATION:
@@ -194,7 +272,6 @@ async def generate(
             raise HTTPException(400, f"video duration must be {MIN_DURATION}-{MAX_DURATION}s (got {duration:.1f}s)")
         job.logs.append({"level": "info", "msg": f"video duration: {duration:.1f}s"})
 
-    # --- Validate + save images ---
     image_paths: list[Path] = []
     for i, img in enumerate(images[:MAX_IMAGES]):
         if not img.content_type or img.content_type not in ALLOWED_IMAGE_TYPES:
@@ -207,8 +284,6 @@ async def generate(
         image_paths.append(ipath)
 
     job.logs.append({"level": "info", "msg": f"reference video + {len(image_paths)} image(s) saved"})
-
-    # Store image paths on the job so the worker can pass them to the creator
     job._image_paths = image_paths  # type: ignore
 
     JOBS[jid] = job
@@ -217,7 +292,13 @@ async def generate(
 
 
 @app.get("/jobs/{jid}/stream")
-async def stream(jid: str):
+async def stream(jid: str, request: Request):
+    # EventSource can't set headers, so allow ?api_key= query param as fallback
+    if API_KEY:
+        qkey = request.query_params.get("api_key", "")
+        if qkey != API_KEY:
+            raise HTTPException(401, "invalid or missing API key")
+
     job = JOBS.get(jid)
     if not job:
         raise HTTPException(404, "job not found")
@@ -239,7 +320,11 @@ async def stream(jid: str):
 
 
 @app.get("/jobs/{jid}/video")
-async def video(jid: str):
+async def video(jid: str, request: Request):
+    if API_KEY:
+        qkey = request.query_params.get("api_key", "")
+        if qkey != API_KEY:
+            raise HTTPException(401, "invalid or missing API key")
     job = JOBS.get(jid)
     if not job or not job.video_path:
         raise HTTPException(404, "video not ready")

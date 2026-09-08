@@ -80,13 +80,21 @@ export default function Page() {
       if (!res.ok) { const e = await res.json().catch(() => ({ error: 'upload failed' })); throw new Error(e.error || 'upload failed'); }
       const { jobId } = await res.json();
       pushLog('ok', `job accepted: ${jobId}`);
-      const es = new EventSource(`${BACKEND}/jobs/${jobId}/stream`);
+
+      // SSE doesn't support custom headers — append API key as query param if set
+      const apiKey = process.env.NEXT_PUBLIC_API_KEY || '';
+      const streamUrl = apiKey
+        ? `${BACKEND}/jobs/${jobId}/stream?api_key=${encodeURIComponent(apiKey)}`
+        : `${BACKEND}/jobs/${jobId}/stream`;
+      const es = new EventSource(streamUrl);
       esRef.current = es;
       es.addEventListener('log', (e) => { const d = JSON.parse((e as MessageEvent).data); pushLog(d.level, d.msg); });
       es.addEventListener('progress', (e) => setProgress(Number((e as MessageEvent).data)));
       es.addEventListener('done', (e) => {
         const d = JSON.parse((e as MessageEvent).data);
-        const vurl = `${BACKEND}/jobs/${jobId}/video`;
+        const vurl = apiKey
+          ? `${BACKEND}/jobs/${jobId}/video?api_key=${encodeURIComponent(apiKey)}`
+          : `${BACKEND}/jobs/${jobId}/video`;
         setVideoUrl(vurl); setVideoName(d.fileName || 'genjutsu.mp4'); setProgress(100);
         pushLog('ok', 'generation complete');
         const item: HistoryItem = { id: jobId, createdAt: Date.now(), prompt, thumbUrl: videoPreview, videoUrl: vurl };

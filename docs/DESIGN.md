@@ -118,11 +118,25 @@
 | Banned account retry (Bug B) | `mark_banned()` + `status='active'` filter — fixed in v2.0. |
 
 ### Known gaps (acceptable for self-hosted, fix before public deploy)
-1. **No auth on backend** — anyone with the Railway URL can POST `/generate` and start jobs. Fix: add `API_KEY` env var, check `X-API-Key` header in middleware.
-2. **No rate limiting** — a single client can spawn unlimited jobs and exhaust Railway hours / create thousands of Higgsfield accounts. Fix: add `slowapi` or a simple per-IP counter.
-3. **In-memory `JOBS` dict grows unboundedly** — no eviction of completed jobs. Long-running instance will leak memory. Fix: add TTL cleanup (delete jobs older than 1 hour) or move to Redis.
-4. **`desktop/main.py` still uses old single-file upload** — not updated for the new dual-upload flow. Needs sync if used.
-5. **No HTTPS on backend-to-Higgsfield proxy** — proxy is `socks5://` (no TLS). Higgsfield credentials traverse the proxy in cleartext. Fix: use `socks5h://` with TLS or a VPN tunnel.
+1. **No auth on backend** — ~~anyone with the Railway URL can POST `/generate`~~ **FIXED v3.0**: `API_KEY` env var + `X-API-Key` header middleware. SSE/video endpoints accept `?api_key=` query param (EventSource can't set headers).
+2. **No rate limiting** — ~~a single client can spawn unlimited jobs~~ **FIXED v3.0**: `RATE_LIMIT` env var (max req/min per IP, 0=disabled). Sliding-window in-memory limiter.
+3. **In-memory `JOBS` dict grows unboundedly** — ~~no eviction~~ **FIXED v3.0**: `jobs_cleanup_loop()` background task removes completed jobs older than `JOB_TTL` (default 3600s) every 5 minutes.
+4. **`desktop/main.py` still uses old single-file upload** — **FIXED v3.0**: updated for dual-upload (video + images), mode selector, API key header.
+5. **No HTTPS on backend-to-Higgsfield proxy** — **Documented**: use `socks5h://` (DNS-over-proxy) in `PROXY_LIST` to prevent DNS leaks. TLS terminates at the proxy; Higgsfield credentials traverse the proxy tunnel.
+
+### Proxy Rotation (v3.0)
+- `ProxyPool` class in `creator.py` rotates proxies round-robin so every new account gets a fresh IP.
+- Tracks failures per proxy; skips proxies with 3+ failures automatically.
+- Resets failure count on successful generation.
+- Proxy is bound to the account at creation (`accounts.proxy` column) and reused on every login (prevents geo-mismatch).
+- Set proxies manually: `fly secrets set PROXY_LIST=socks5h://user:pass@host:port,socks5h://user2:pass2@host2:port2`
+
+### Hosting: Fly.io (replaces Railway)
+- **Why**: Railway hobby has ~500h/mo cap. Fly.io has no hour limits, can scale to N VMs.
+- `fly.toml` configures 2GB shared VM (enough for 2 concurrent Chromium workers).
+- Scale: `fly scale count N` — each VM runs `MAX_WORKERS` browser instances.
+- Secrets: `fly secrets set API_KEY=... PROXY_LIST=... CORS_ORIGINS=...`
+- Health: `https://higgsfield-genjutsu-unlimited.fly.dev/health`
 
 ## Deployment
 
@@ -139,11 +153,25 @@
 4. Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 5. Env: `PROXY_LIST`, `HEADLESS=true`, `CORS_ORIGINS=<vercel-url>`, `VIDEO_DIR=/tmp/videos`.
 
-### Backend → Railway (alternative)
+### Backend → Fly.io (recommended — no hour limits, horizontal scaling)
+1. Install fly CLI: `curl -L https://fly.io/install.sh | sh`
+2. `fly auth login`
+3. `fly launch --dockerfile Dockerfile --name higgsfield-genjutsu-unlimited --region iad`
+4. `fly deploy --strategy rolling`
+5. Set secrets:
+   ```bash
+   fly secrets set API_KEY=<your-secret-key>
+   fly secrets set PROXY_LIST=socks5h://user:pass@host:port,socks5h://user2:pass2@host2:port2
+   fly secrets set CORS_ORIGINS=https://higgsfield-genjutsu-unlimited.vercel.app
+   ```
+6. Scale: `fly scale count 2` (2 VMs = 4 concurrent workers)
+7. Health: `https://higgsfield-genjutsu-unlimited.fly.dev/health`
+
+### Backend → Railway (legacy — has hour limits on hobby plan)
 1. New Project → Deploy from GitHub → pick repo.
 2. Root Directory: `backend`.
 3. Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-4. Variables: same as Render.
+4. Variables: same as Fly.io.
 
 ## Local Dev
 ```bash

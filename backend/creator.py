@@ -34,11 +34,52 @@ LOCALE = os.getenv("BROWSER_LOCALE", "en-US")
 RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "300"))  # Gap F: 5 min overall cap
 
 
+class ProxyPool:
+    """Rotates proxies round-robin so every new account gets a fresh IP.
+    Tracks failures and skips dead proxies automatically.
+    """
+    def __init__(self, proxies: list[str]):
+        self.proxies = proxies
+        self._idx = 0
+        self._failures: dict[str, int] = {}
+        self._lock = asyncio.Lock()
+
+    async def next(self) -> Optional[str]:
+        if not self.proxies:
+            return None
+        async with self._lock:
+            # try up to len(proxies) times to find a healthy one
+            for _ in range(len(self.proxies)):
+                p = self.proxies[self._idx % len(self.proxies)]
+                self._idx += 1
+                if self._failures.get(p, 0) < 3:  # skip if 3+ failures
+                    return p
+            # all proxies are failing — return the least-bad one
+            return min(self.proxies, key=lambda p: self._failures.get(p, 0))
+
+    async def record_failure(self, proxy: str):
+        async with self._lock:
+            self._failures[proxy] = self._failures.get(proxy, 0) + 1
+
+    async def reset(self, proxy: str):
+        async with self._lock:
+            self._failures.pop(proxy, None)
+
+    @property
+    def size(self) -> int:
+        return len(self.proxies)
+
+
+# Singleton proxy pool — shared across all workers
+PROXY_POOL = ProxyPool(PROXY_LIST)
+
+
 async def human_delay(lo=0.5, hi=2.0):
     await asyncio.sleep(random.uniform(lo, hi))
 
-def pick_proxy() -> Optional[str]:
-    return random.choice(PROXY_LIST) if PROXY_LIST else None
+async def pick_proxy() -> Optional[str]:
+    """Get the next proxy from the rotating pool (new IP each call)."""
+    return await PROXY_POOL.next()
 
 def random_password() -> str:
     return "".join(random.choices(_string.ascii_letters + _string.digits + "!@#$%", k=16))
@@ -183,17 +224,24 @@ class HiggsfieldCreator:
         for attempt in range(1, 4):
             try:
                 await self._log("info", f"attempt {attempt}/3")
-                return await self._attempt(reference_path, prompt)
+                result = await self._attempt(reference_path, prompt)
+                # Reset proxy failure count on success
+                if self.proxy:
+                    await PROXY_POOL.reset(self.proxy)
+                return result
             except Exception as e:
                 last_err = e
                 await self._log("warn", f"attempt {attempt} failed: {e}")
+                # Record proxy failure so the pool can skip dead proxies
+                if self.proxy and not self.reused_account:
+                    await PROXY_POOL.record_failure(self.proxy)
                 if self.page: await self._shot(f"fail_attempt{attempt}")
                 await self._cleanup(); await asyncio.sleep(3)
         await self._cleanup()
         raise RuntimeError(f"all 3 attempts failed: {last_err}")
 
     async def _attempt(self, reference_path, prompt) -> Path:
-        # Gap G: proxy chosen once, bound to account for its lifetime
+        # Gap G + ProxyPool: proxy chosen from rotating pool, bound to account for its lifetime
         acct = await get_account_with_credits()
         if acct:
             self.email = acct["email"]; self.password = acct["password"]
@@ -201,10 +249,10 @@ class HiggsfieldCreator:
             self.reused_account = True
             await self._log("info", f"reusing account {self.email} (proxy={self.proxy or 'none'})")
         else:
-            self.proxy = pick_proxy()
+            self.proxy = await pick_proxy()  # fresh IP every new account
             self.reused_account = False
 
-        await self._log("info", f"launching browser (proxy={'yes' if self.proxy else 'no'})")
+        await self._log("info", f"launching browser (proxy={'yes' if self.proxy else 'no'}, pool={PROXY_POOL.size})")
         self._pw = await async_playwright().start()
         launch_args = {"headless": HEADLESS, "locale": LOCALE,
                        "args": ["--disable-blink-features=AutomationControlled"]}

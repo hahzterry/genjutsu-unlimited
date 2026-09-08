@@ -38,7 +38,11 @@ export async function POST(req: NextRequest) {
   out.append('prompt', prompt);
   out.append('mode', mode as string);
 
-  const r = await fetch(`${backend}/generate`, { method: 'POST', body: out });
+  const headers: Record<string, string> = {};
+  const apiKey = process.env.NEXT_PUBLIC_API_KEY || process.env.API_KEY;
+  if (apiKey) headers['X-API-Key'] = apiKey;
+
+  const r = await fetch(`${backend}/generate`, { method: 'POST', body: out, headers });
   if (!r.ok) {
     const txt = await r.text();
     return NextResponse.json({ error: txt }, { status: r.status });

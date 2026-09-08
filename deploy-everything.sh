@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # deploy-everything.sh
-# One-command build + push + deploy for higgsfield-genjutsu-unlimited
+# One-command build + push + deploy for higgsfield-genjutsu-unlimited v3.0
+# Deploys: GitHub (repo) + Vercel (frontend) + Fly.io (backend, no hour limits)
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -15,8 +16,9 @@ OWNER="SabauAlexandru-py"
 REMOTE="git@github.com:${OWNER}/${REPO}.git"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-banner "Higgsfield Genjutsu Unlimited — Deployer"
+banner "Higgsfield Genjutsu Unlimited v3.0 — Deployer"
 
+# --- Prereqs ---
 if ! command -v git >/dev/null 2>&1; then err "git missing"; exit 1; fi
 ok "git present"
 
@@ -53,7 +55,7 @@ git add -A
 if git diff --cached --quiet; then
   warn "nothing to commit (clean tree)"
 else
-  git commit -q -m "Initial commit - Higgsfield Genjutsu Unlimited v1.0"
+  git commit -q -m "Deploy: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   ok "committed"
 fi
 
@@ -61,6 +63,7 @@ info "pushing to main..."
 git push -u origin main
 ok "pushed to github.com/${OWNER}/${REPO}"
 
+# --- Frontend → Vercel ---
 banner "Frontend → Vercel"
 if ! command -v vercel >/dev/null 2>&1; then
   info "vercel CLI missing — installing..."
@@ -86,32 +89,62 @@ fi
 vercel deploy --prod --yes
 ok "frontend deployed to Vercel"
 
-banner "Backend → Render / Railway"
-cat <<'EOF'
-NEXT STEPS — Backend deployment
+cd "$SCRIPT_DIR"
 
-1. Render.com:
-   - New → Web Service → connect repo SabauAlexandru-py/higgsfield-genjutsu-unlimited
-   - Root Directory:  backend
-   - Build Command:   pip install -r requirements.txt && python -m playwright install --with-deps chromium
-   - Start Command:  uvicorn main:app --host 0.0.0.0 --port $PORT
-   - Env: PROXY_LIST, HEADLESS=true, BROWSER_LOCALE=en-US, CORS_ORIGINS=https://higgsfield-genjutsu-unlimited.vercel.app
+# --- Backend → Fly.io ---
+banner "Backend → Fly.io (no hour limits, horizontal scaling)"
 
-2. Railway.app:
-   - New Project → Deploy from GitHub repo → select repo
-   - Root Directory: backend
-   - Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
-   - Variables: same as Render
+if ! command -v fly >/dev/null 2>&1; then
+  info "fly CLI missing — installing..."
+  curl -L https://fly.io/install.sh | sh
+  export PATH="$HOME/.fly/bin:$PATH"
+fi
+ok "fly present"
 
-3. Wire frontend → backend:
-   - Vercel dashboard → project → Settings → Environment Variables
-   - Add: NEXT_PUBLIC_BACKEND_URL = https://your-backend.onrender.com
-   - Redeploy frontend.
+if ! fly auth whoami >/dev/null 2>&1; then
+  warn "fly not authenticated. Launching login..."
+  fly auth login
+fi
+ok "fly authenticated"
 
-4. Residential proxies:
-   - Edit backend/.env (copy from .env.example)
-   - PROXY_LIST = comma-separated socks5://user:pass@host:port
-EOF
+if ! fly apps list | grep -q "higgsfield-genjutsu-unlimited"; then
+  info "creating Fly.io app..."
+  fly launch --no-deploy --name higgsfield-genjutsu-unlimited --region iad --dockerfile Dockerfile
+  ok "Fly.io app created"
+else
+  ok "Fly.io app already exists"
+fi
 
-ok "all done"
-echo -e "${PURPLE}Repo:    https://github.com/${OWNER}/${REPO}${NC}"
+info "deploying backend to Fly.io..."
+fly deploy --dockerfile Dockerfile --strategy rolling
+ok "backend deployed to Fly.io"
+
+info "setting secrets..."
+echo "  Set your API key and proxy list manually:"
+echo -e "  ${YELLOW}fly secrets set API_KEY=<your-secret-key>${NC}"
+echo -e "  ${YELLOW}fly secrets set PROXY_LIST=socks5://user:pass@host:port,socks5://user2:pass2@host2:port2${NC}"
+echo -e "  ${YELLOW}fly secrets set CORS_ORIGINS=https://higgsfield-genjutsu-unlimited.vercel.app${NC}"
+
+info "scaling to 2 VMs (4 concurrent workers)..."
+fly scale count 2 --max-per-region 4
+ok "scaled to 2 VMs"
+
+FLY_URL="https://higgsfield-genjutsu-unlimited.fly.dev"
+
+banner "Wire frontend → backend"
+echo -e "  Vercel dashboard → project → Settings → Environment Variables"
+echo -e "  Add: ${YELLOW}NEXT_PUBLIC_BACKEND_URL = ${FLY_URL}${NC}"
+echo -e "  Add: ${YELLOW}NEXT_PUBLIC_API_KEY = <your-secret-key>${NC}"
+echo -e "  Redeploy frontend."
+
+banner "Done"
+echo -e "${PURPLE}Repo:     https://github.com/${OWNER}/${REPO}${NC}"
+echo -e "${PURPLE}Frontend:  https://higgsfield-genjutsu-unlimited.vercel.app${NC}"
+echo -e "${PURPLE}Backend:   ${FLY_URL}${NC}"
+echo -e "${PURPLE}Health:    ${FLY_URL}/health${NC}"
+echo ""
+echo -e "${YELLOW}To spam unlimited generations:${NC}"
+echo -e "  1. Set PROXY_LIST with your residential proxies (fly secrets set ...)"
+echo -e "  2. Set API_KEY and use it in the X-API-Key header"
+echo -e "  3. Scale workers: fly scale count N  (each VM runs MAX_WORKERS browsers)"
+echo -e "  4. Each generation creates a fresh account on a fresh IP = unlimited free videos"
