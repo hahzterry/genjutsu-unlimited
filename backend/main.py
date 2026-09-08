@@ -271,7 +271,7 @@ async def set_proxies(request: Request):
 async def generate(
     video: UploadFile = File(...),
     images: List[UploadFile] = File(default=[]),
-    prompt: str = Form(...),
+    prompt: str = Form(""),  # was Form(...) — FastAPI treats empty string as missing
     mode: str = Form("motion_transfer"),
 ):
     if not video.content_type or video.content_type not in ALLOWED_VIDEO_TYPES:
