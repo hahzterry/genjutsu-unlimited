@@ -263,8 +263,11 @@ async def set_proxies(request: Request):
     if not isinstance(new_proxies, list):
         raise HTTPException(400, "proxies must be a list of strings")
     from creator import PROXY_POOL
-    PROXY_POOL.update_proxies(new_proxies)
-    log.info(f"proxy pool updated: {len(new_proxies)} proxies")
+    from proxy_manager import parse_proxy_line
+    # Parse IP:PORT:USERNAME:PASSWORD → socks5h://...
+    parsed = [parse_proxy_line(p) for p in new_proxies if p and p.strip()]
+    PROXY_POOL.update_proxies(parsed)
+    log.info(f"proxy pool updated: {len(parsed)} proxies")
     return {"count": PROXY_POOL.size, "status": "updated"}
 
 

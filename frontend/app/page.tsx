@@ -156,15 +156,15 @@ export default function Page() {
           <div className="mx-auto max-w-3xl">
             <h3 className="mb-2 text-sm font-bold text-zinc-200">Proxy Settings</h3>
             <p className="mb-2 text-xs text-zinc-500">
-              Add residential proxies (comma-separated). Each new account gets a fresh IP from this pool.
-              Use <code className="text-lime">socks5h://</code> for DNS-over-proxy (prevents DNS leak).
+              Add residential proxies. Format: <code className="text-lime">IP:PORT:USERNAME:PASSWORD</code> (one per line or comma-separated).
+              Each new account gets a fresh IP from the pool.
             </p>
             <div className="flex gap-2">
               <input
                 type="text"
                 value={proxies}
                 onChange={(e) => setProxies(e.target.value)}
-                placeholder="socks5h://user:pass@host:port,socks5h://user2:pass2@host2:port2"
+                placeholder="thehub.proxy-cheap.com:8080:kqIUSOsHDdfv2rp:FGUWRrIgSbjIODo"
                 className="flex-1 rounded-lg border border-zinc-700 bg-panel2 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-lime"
               />
               <button

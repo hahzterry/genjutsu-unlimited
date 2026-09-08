@@ -159,10 +159,33 @@ class ProxyManager:
         }
 
 
+def parse_proxy_line(line: str) -> str:
+    """Parse IP:PORT:USERNAME:PASSWORD format → socks5h://username:password@ip:port.
+    Also accepts socks5h://... format directly (passthrough).
+    """
+    line = line.strip()
+    if not line:
+        return ""
+    if line.startswith("socks5") or line.startswith("socks4") or line.startswith("http"):
+        return line  # already a full proxy URL
+    # Format: IP:PORT:USERNAME:PASSWORD
+    parts = line.split(":")
+    if len(parts) >= 4:
+        ip = parts[0]
+        port = parts[1]
+        username = parts[2]
+        password = ":".join(parts[3:])  # password may contain colons
+        return f"socks5h://{username}:{password}@{ip}:{port}"
+    return line  # can't parse, return as-is
+
+
 def load_proxy_list() -> list[str]:
-    """Load proxies from PROXY_LIST or PROXIES env var (pipe | or comma separated)."""
+    """Load proxies from PROXY_LIST or PROXIES env var (pipe | or comma separated).
+    Accepts IP:PORT:USERNAME:PASSWORD or socks5h://... format.
+    """
     raw = os.getenv("PROXY_LIST", "") or os.getenv("PROXIES", "")
-    # Support both pipe | and comma , separators
     if "|" in raw:
-        return [p.strip() for p in raw.split("|") if p.strip()]
-    return [p.strip() for p in raw.split(",") if p.strip()]
+        lines = [p.strip() for p in raw.split("|") if p.strip()]
+    else:
+        lines = [p.strip() for p in raw.split(",") if p.strip()]
+    return [parse_proxy_line(line) for line in lines if line]
