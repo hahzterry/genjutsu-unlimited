@@ -22,7 +22,7 @@ import logging
 from typing import Optional, Callable, Awaitable
 from pathlib import Path
 
-from undetected_playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, Page, BrowserContext
 
 from temp_mail import TempMail
 from database import save_account, get_account_with_credits, mark_used
