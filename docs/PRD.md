@@ -30,10 +30,18 @@ free Genjutsu videos from the user's perspective.
 
 ## Non-Functional Requirements
 - Anti-detection via `undetected-playwright` + fingerprint spoofing + human delays.
-- Robust selectors with multiple fallbacks (text / placeholder / role / css).
+- Robust selectors with multiple fallbacks (text / placeholder / role / css), scoped to the
+  settings dialog container first (Bug D fix).
 - Cold-start tolerant: backend recovers and retries on transient failures.
 - Single-instance job store (Redis optional for horizontal scale).
 - Frontend deployable to Vercel; backend deployable to Render/Railway.
+- **Credit integrity**: `mark_used()` fires immediately after generation succeeds, before
+  download — no credit leak on download failure (Bug A fix).
+- **Account hygiene**: banned accounts are marked `status='banned'` and never retried;
+  `get_account_with_credits()` only returns `status='active'` rows (Bug B fix).
+- **Proxy binding**: each account stores the proxy used at signup and reuses it on every
+  login, preventing geo-mismatch flags (Gap G fix).
+- **Overall timeout**: 5-minute cap on the entire generation via `asyncio.wait_for` (Gap F fix).
 
 ## Out of Scope (v1)
 - Captcha solving (manual fallback noted in DESIGN.md).

@@ -12,7 +12,7 @@ import asyncio
 import re
 import random
 import string
-from typing import Callable
+from typing import Callable, Awaitable
 import httpx
 
 API = "https://www.1secmail.com/api/v1/"
@@ -65,17 +65,20 @@ class TempMail:
 
     async def wait_for_link(
         self,
-        log: Callable[[str], None] = lambda m: None,
+        log: Callable[[str], Awaitable[None]] | None = None,
         link_re: re.Pattern = LINK_RE,
     ) -> str:
         """Poll the inbox until a verification link arrives. Returns the link."""
+        async def _noop(_m: str) -> None:
+            pass
+        _log = log or _noop
         elapsed = 0
         seen: set[int] = set()
         while elapsed < POLL_TIMEOUT:
             try:
                 msgs = await self.get_messages()
             except Exception as e:
-                log(f"inbox poll error: {e}")
+                await _log(f"inbox poll error: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
                 elapsed += POLL_INTERVAL
                 continue
@@ -84,7 +87,7 @@ class TempMail:
                 if m["id"] in seen:
                     continue
                 seen.add(m["id"])
-                log(f"mail from {m.get('from')}: {m.get('subject')}")
+                await _log(f"mail from {m.get('from')}: {m.get('subject')}")
                 full = await self.read_message(m["id"])
                 body = full.get("htmlBody") or full.get("body") or full.get("textBody") or ""
                 match = link_re.search(body)

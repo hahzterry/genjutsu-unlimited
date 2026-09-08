@@ -28,3 +28,10 @@ vercel deploy --prod
   references, point the frontend directly at the backend by setting
   `NEXT_PUBLIC_BACKEND_URL` and changing the upload `fetch` target in `page.tsx`
   from `/api/generate` to `${BACKEND}/generate`.
+- **Credit-leak fix (Bug A)**: the backend now marks an account's credit consumed
+  immediately after generation succeeds, before the download step. If the download
+  fails, the account is already at `credits=0` and won't be retried with a stale credit.
+- **Proxy binding (Gap G)**: when `PROXY_LIST` is set, each new account stores the proxy
+  used at signup in `accounts.proxy` and reuses it on every subsequent login. This
+  prevents Higgsfield from flagging geo-mismatches when a different proxy is rotated in.
+  Set `PROXY_LIST` on Railway: `railway variable set "PROXY_LIST=socks5://user:pass@host:port"`.

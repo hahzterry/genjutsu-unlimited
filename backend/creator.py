@@ -2,14 +2,23 @@
 
 Pipeline: temp email -> signup -> verify -> login -> Create page ->
   Model=Higgsfield Genjutsu, Quality=720p, Use free gens=ON ->
-  upload reference -> prompt -> generate -> download.
+  upload reference -> prompt -> generate -> mark-consumed -> download.
+
+Bug fixes vs prior version:
+  A: mark_used() fires right after generation (before download) — no credit leak.
+  B: banned reused accounts are marked 'banned' in DB, never retried.
+  C: 404 detection uses HTTP response status, not fragile title text.
+  D: settings-row selectors scoped to a dialog/panel container first.
+  E: TempMail log callback is now properly awaited (no fire-and-forget).
+  F: overall 5-minute timeout wraps the entire retry loop.
+  G: proxy is bound to the account at creation and reused on every login.
 """
 import os, asyncio, random, logging, string as _string
 from typing import Optional, Callable, Awaitable
 from pathlib import Path
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, Page, BrowserContext, Locator
 from temp_mail import TempMail
-from database import save_account, get_account_with_credits, mark_used
+from database import save_account, get_account_with_credits, mark_used, mark_banned
 
 log = logging.getLogger("creator")
 HIGGS = "https://higgsfield.ai"
@@ -22,6 +31,7 @@ VIDEO_DIR = Path(os.getenv("VIDEO_DIR", "/tmp/videos")); VIDEO_DIR.mkdir(parents
 PROXY_LIST = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 LOCALE = os.getenv("BROWSER_LOCALE", "en-US")
+RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "300"))  # Gap F: 5 min overall cap
 
 
 async def human_delay(lo=0.5, hi=2.0):
@@ -39,27 +49,27 @@ def random_name() -> tuple[str, str]:
     return random.choice(f), random.choice(l)
 
 
-async def click_any(page, selectors, timeout=15000):
+async def click_any(scope, selectors, timeout=15000) -> bool:
     for sel in selectors:
         try:
-            loc = page.locator(sel).first
+            loc = scope.locator(sel).first
             if await loc.wait_for(state="visible", timeout=timeout):
                 await loc.click(); return True
         except Exception:
             continue
     return False
 
-async def fill_any(page, value, selectors, timeout=15000):
+async def fill_any(scope, value, selectors, timeout=15000) -> bool:
     for sel in selectors:
         try:
-            loc = page.locator(sel).first
+            loc = scope.locator(sel).first
             if await loc.wait_for(state="visible", timeout=timeout):
                 await loc.fill(value); return True
         except Exception:
             continue
     return False
 
-async def wait_any(page, selectors, timeout=30000):
+async def wait_any(page, selectors, timeout=30000) -> bool:
     for sel in selectors:
         try:
             if await page.locator(sel).first.wait_for(state="visible", timeout=timeout):
@@ -79,11 +89,26 @@ async def detect_captcha(page) -> bool:
             continue
     return False
 
-async def select_menu_option(page, row_label, option_text, log_cb=None):
-    """Open a settings row (Model/Quality) and pick an option by visible text."""
+
+async def _find_settings_scope(page) -> Locator:
+    """Bug D fix: return the best settings container, or page root as fallback."""
+    containers = ['[role="dialog"]', '[aria-modal="true"]', '.settings-panel',
+                  '.modal', '[class*="settings" i]', 'main', 'body']
+    for c in containers:
+        try:
+            loc = page.locator(c).first
+            if await loc.wait_for(state="visible", timeout=2000):
+                return loc
+        except Exception:
+            continue
+    return page
+
+
+async def select_menu_option(page, row_label, option_text, log_cb=None) -> bool:
+    scope = await _find_settings_scope(page)
     row_sels = [f'button:has-text("{row_label}")', f'[role="button"]:has-text("{row_label}")',
                 f'div:has-text("{row_label}") >> nth=0', f'text="{row_label}"']
-    opened = await click_any(page, row_sels, timeout=8000)
+    opened = await click_any(scope, row_sels, timeout=8000)
     if not opened and log_cb: await log_cb("warn", f"could not open '{row_label}' row")
     await human_delay(0.4, 1.0)
     opt_sels = [f'[role="option"]:has-text("{option_text}")', f'li:has-text("{option_text}")',
@@ -93,15 +118,16 @@ async def select_menu_option(page, row_label, option_text, log_cb=None):
     if not picked and log_cb: await log_cb("warn", f"could not pick '{option_text}' from '{row_label}'")
     return picked
 
-async def ensure_toggle_on(page, label_text, log_cb=None):
-    """Ensure a toggle labelled `label_text` is ON. Click only if currently OFF."""
+
+async def ensure_toggle_on(page, label_text, log_cb=None) -> bool:
+    scope = await _find_settings_scope(page)
     sw_sels = [f'div:has-text("{label_text}") >> [role="switch"]',
                f'div:has-text("{label_text}") >> button[role="switch"]',
                f'div:has-text("{label_text}") >> [aria-checked]',
                f'div:has-text("{label_text}") >> button[type="button"]:has(svg)']
     for sel in sw_sels:
         try:
-            sw = page.locator(sel).first
+            sw = scope.locator(sel).first
             if not await sw.wait_for(state="visible", timeout=8000):
                 continue
             checked = await sw.get_attribute("aria-checked")
@@ -126,6 +152,8 @@ class HiggsfieldCreator:
         self.email = ""; self.password = random_password()
         self.first, self.last = random_name()
         self.ctx = None; self.page = None
+        self.proxy: Optional[str] = None       # Gap G
+        self.reused_account = False             # Bug B
 
     async def _log(self, level, msg):
         log.info(f"[{level}] {msg}")
@@ -140,6 +168,16 @@ class HiggsfieldCreator:
             pass
 
     async def run(self, reference_path, prompt) -> Path:
+        # Gap F: overall timeout wraps the entire retry loop
+        try:
+            return await asyncio.wait_for(
+                self._run_with_retries(reference_path, prompt), timeout=RUN_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            await self._cleanup()
+            raise RuntimeError(f"generation exceeded {RUN_TIMEOUT}s overall timeout")
+
+    async def _run_with_retries(self, reference_path, prompt) -> Path:
         last_err = None
         for attempt in range(1, 4):
             try:
@@ -154,12 +192,22 @@ class HiggsfieldCreator:
         raise RuntimeError(f"all 3 attempts failed: {last_err}")
 
     async def _attempt(self, reference_path, prompt) -> Path:
-        proxy = pick_proxy()
-        await self._log("info", f"launching browser (proxy={'yes' if proxy else 'no'})")
+        # Gap G: proxy chosen once, bound to account for its lifetime
+        acct = await get_account_with_credits()
+        if acct:
+            self.email = acct["email"]; self.password = acct["password"]
+            self.proxy = acct.get("proxy")
+            self.reused_account = True
+            await self._log("info", f"reusing account {self.email} (proxy={self.proxy or 'none'})")
+        else:
+            self.proxy = pick_proxy()
+            self.reused_account = False
+
+        await self._log("info", f"launching browser (proxy={'yes' if self.proxy else 'no'})")
         self._pw = await async_playwright().start()
         launch_args = {"headless": HEADLESS, "locale": LOCALE,
                        "args": ["--disable-blink-features=AutomationControlled"]}
-        if proxy: launch_args["proxy"] = {"server": proxy}
+        if self.proxy: launch_args["proxy"] = {"server": self.proxy}
         self.browser = await self._pw.chromium.launch(**launch_args)
         self.ctx = await self.browser.new_context(
             viewport={"width": 1440, "height": 900},
@@ -172,14 +220,14 @@ class HiggsfieldCreator:
             "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});")
         self.page = await self.ctx.new_page()
 
-        acct = await get_account_with_credits()
-        if acct:
-            self.email = acct["email"]; self.password = acct["password"]
-            await self._log("info", f"reusing account {self.email} ({acct['credits']} credits)")
-        else:
+        if not self.reused_account:
             await self._create_account()
         await self._login()
         await self._run_genjutsu(reference_path, prompt)
+        # Bug A fix: mark credit consumed RIGHT AFTER generation succeeds,
+        # before the failure-prone download step. No credit leak on download error.
+        await mark_used(self.email, 0)
+        await self._log("ok", f"account {self.email} marked used (credits=0)")
         return await self._download_result()
 
     async def _create_account(self):
@@ -208,14 +256,17 @@ class HiggsfieldCreator:
         if not ok: raise RuntimeError("signup submit button not found")
         await self._log("info", "signup form submitted")
         await self._log("info", "waiting for verification email...")
-        link = await self.mail.wait_for_link(log=lambda m: asyncio.ensure_future(self._log("info", m)))
+        # Bug E fix: async callback, properly awaited inside TempMail.wait_for_link
+        link = await self.mail.wait_for_link(log=lambda m: self._log("info", m))
         await self._log("ok", f"verification link: {link}")
         await self.page.goto(link, wait_until="networkidle"); await human_delay()
         if await detect_captcha(self.page):
             await self._shot("captcha_verify")
             raise RuntimeError("captcha on verification - needs a solver or manual solve")
         await self._log("ok", "email verified")
-        await save_account(self.email, self.password, credits=1)
+        # Gap G: bind proxy used at signup to this account
+        await save_account(self.email, self.password, credits=1, proxy=self.proxy)
+        await self._log("ok", f"account saved (proxy bound: {self.proxy or 'none'})")
 
     async def _login(self):
         await self.page.goto(LOGIN, wait_until="networkidle"); await human_delay()
@@ -229,13 +280,19 @@ class HiggsfieldCreator:
         await click_any(self.page, ['button[type="submit"]', 'button:has-text("Log in")',
             'button:has-text("Sign in")'])
         await self.page.wait_for_load_state("networkidle")
+        # Bug B fix: verify login succeeded; mark reused account banned if it failed
+        if "/login" in self.page.url:
+            if self.reused_account:
+                await mark_banned(self.email)
+                await self._log("warn", f"account {self.email} marked BANNED (login failed)")
+            raise RuntimeError("login failed - still on /login (bad creds or banned)")
         await self._log("ok", "logged in")
 
     async def _run_genjutsu(self, reference_path, prompt):
-        await self.page.goto(CREATE, wait_until="networkidle")
-        title = await self.page.title()
-        if "404" in title or "not found" in title.lower():
-            await self._log("info", "/create not found, falling back to /genjutsu")
+        # Bug C fix: use HTTP response status for 404 detection
+        resp = await self.page.goto(CREATE, wait_until="networkidle")
+        if resp and resp.status >= 400:
+            await self._log("info", f"/create returned {resp.status}, falling back to /genjutsu")
             await self.page.goto(GENJUTSU, wait_until="networkidle")
         await human_delay()
         await self._log("info", f"navigated to create interface ({self.page.url})")
@@ -297,7 +354,6 @@ class HiggsfieldCreator:
                 await self._log("ok", f"video fetched via src: {out.name}")
             else:
                 raise RuntimeError(f"video fetch failed: HTTP {resp.status}")
-        await mark_used(self.email, 0)
         return out
 
     async def _cleanup(self):
@@ -311,3 +367,6 @@ class HiggsfieldCreator:
         self.ctx = self.page = None
         if hasattr(self, "browser"): self.browser = None
         if hasattr(self, "_pw"): self._pw = None
+
+
+
