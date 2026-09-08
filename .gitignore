@@ -1,0 +1,25 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.db
+backend/.env
+backend/videos/
+backend/uploads/
+backend/accounts.db
+
+# node
+node_modules/
+.next/
+.vercel/
+out/
+build/
+*.log
+.DS_Store
+
+# editor
+.vscode/
+.idea/
+*.swp

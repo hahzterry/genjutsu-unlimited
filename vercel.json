@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "projectId": "higgsfield-genjutsu-unlimited",
+  "orgId": "SabauAlexandru-py",
+  "redirects": [
+    { "source": "/", "destination": "https://higgsfield-genjutsu-unlimited.vercel.app", "permanent": false }
+  ]
+}
