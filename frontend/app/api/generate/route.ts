@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
+export const maxDuration = 300; // 5 min — matches backend RUN_TIMEOUT
 
 /**
  * POST /api/generate
- * multipart: file (reference), prompt (string)
+ * multipart: video (required), images[] (optional, up to 30), prompt (string), mode (string)
  * proxies to the python backend and returns { jobId }
  */
 export async function POST(req: NextRequest) {
@@ -17,15 +18,25 @@ export async function POST(req: NextRequest) {
   }
 
   const form = await req.formData();
-  const file = form.get('file');
+  const video = form.get('video');
   const prompt = form.get('prompt');
-  if (!(file instanceof File) || typeof prompt !== 'string') {
-    return NextResponse.json({ error: 'file and prompt required' }, { status: 400 });
+  const mode = form.get('mode') || 'motion_transfer';
+
+  if (!(video instanceof File) || !video.type.startsWith('video/')) {
+    return NextResponse.json({ error: 'a video file is required' }, { status: 400 });
+  }
+  if (typeof prompt !== 'string') {
+    return NextResponse.json({ error: 'prompt is required (can be empty)' }, { status: 400 });
   }
 
+  // Collect images (FormData.getAll returns all values for the key)
+  const images = form.getAll('images').filter((f): f is File => f instanceof File && f.type.startsWith('image/'));
+
   const out = new FormData();
-  out.append('file', file, file.name);
+  out.append('video', video, video.name);
+  images.forEach((img) => out.append('images', img, img.name));
   out.append('prompt', prompt);
+  out.append('mode', mode as string);
 
   const r = await fetch(`${backend}/generate`, { method: 'POST', body: out });
   if (!r.ok) {

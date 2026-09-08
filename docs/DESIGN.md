@@ -102,6 +102,28 @@
 | Fire-and-forget logging (Bug E) | `TempMail.wait_for_link` log callback is now `Callable[[str], Awaitable[None]]` and properly awaited. |
 | No overall timeout (Gap F) | `run()` wraps the entire retry loop in `asyncio.wait_for(..., timeout=300)`. |
 
+## Security Audit (v2.0)
+
+### Mitigated
+| Risk | Mitigation |
+|---|---|
+| Path traversal in filenames | Backend uses `jid` (UUID hex) as filename prefix, never user-supplied names. `_safe_filename()` available if needed. |
+| Malicious file types | `ALLOWED_VIDEO_TYPES` + `ALLOWED_IMAGE_TYPES` whitelist enforced in `main.py`. Frontend `accept` attributes match. |
+| Oversized uploads | `MAX_VIDEO_SIZE=100MB`, `MAX_IMAGE_SIZE=20MB`, `MAX_IMAGES=30` enforced server-side. |
+| Video duration abuse | ffprobe duration check in `main.py` (4–30s). Frontend also validates via `<video>` element. Defense in depth. |
+| Secret leakage | `.env.local` (contains Vercel OIDC token) is gitignored via `frontend/.gitignore` `.env*`. Not in repo. |
+| CORS wildcard | Production `CORS_ORIGINS` set to specific Vercel URLs on Railway. Default `*` only for local dev. |
+| SSRF via proxy | Proxy is set via `PROXY_LIST` env var, not user input. No user-controlled outbound URLs. |
+| Credit leak (Bug A) | `mark_used()` fires before download — fixed in v2.0. |
+| Banned account retry (Bug B) | `mark_banned()` + `status='active'` filter — fixed in v2.0. |
+
+### Known gaps (acceptable for self-hosted, fix before public deploy)
+1. **No auth on backend** — anyone with the Railway URL can POST `/generate` and start jobs. Fix: add `API_KEY` env var, check `X-API-Key` header in middleware.
+2. **No rate limiting** — a single client can spawn unlimited jobs and exhaust Railway hours / create thousands of Higgsfield accounts. Fix: add `slowapi` or a simple per-IP counter.
+3. **In-memory `JOBS` dict grows unboundedly** — no eviction of completed jobs. Long-running instance will leak memory. Fix: add TTL cleanup (delete jobs older than 1 hour) or move to Redis.
+4. **`desktop/main.py` still uses old single-file upload** — not updated for the new dual-upload flow. Needs sync if used.
+5. **No HTTPS on backend-to-Higgsfield proxy** — proxy is `socks5://` (no TLS). Higgsfield credentials traverse the proxy in cleartext. Fix: use `socks5h://` with TLS or a VPN tunnel.
+
 ## Deployment
 
 ### Frontend → Vercel

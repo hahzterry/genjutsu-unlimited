@@ -167,8 +167,9 @@ class HiggsfieldCreator:
         except Exception:
             pass
 
-    async def run(self, reference_path, prompt) -> Path:
+    async def run(self, reference_path, prompt, image_paths: list[Path] | None = None) -> Path:
         # Gap F: overall timeout wraps the entire retry loop
+        self._image_paths = image_paths or []
         try:
             return await asyncio.wait_for(
                 self._run_with_retries(reference_path, prompt), timeout=RUN_TIMEOUT
@@ -309,13 +310,52 @@ class HiggsfieldCreator:
         await self._log("info", "ensuring 'Use free gens' is ON")
         await ensure_toggle_on(self.page, "Use free gens", self._log)
         await human_delay()
-        file_input = self.page.locator('input[type="file"]').first
-        try:
-            await file_input.wait_for(state="attached", timeout=15000)
-        except Exception:
-            raise RuntimeError("file input not found on create page")
-        await file_input.set_input_files(reference_path)
-        await self._log("info", "reference uploaded")
+        # Upload reference VIDEO (required) — find the video file input
+        file_inputs = self.page.locator('input[type="file"]')
+        count = await file_inputs.count()
+        await self._log("info", f"found {count} file input(s) on create page")
+        video_uploaded = False
+        for i in range(count):
+            inp = file_inputs.nth(i)
+            accept = await inp.get_attribute("accept") or ""
+            if "video" in accept or "video" not in accept:
+                try:
+                    await inp.set_input_files(reference_path)
+                    await self._log("info", f"reference video uploaded to input #{i}")
+                    video_uploaded = True
+                    break
+                except Exception:
+                    continue
+        if not video_uploaded:
+            # fallback: first file input
+            await file_inputs.first.set_input_files(reference_path)
+            await self._log("info", "reference video uploaded (fallback to first input)")
+        await human_delay(1, 2)
+
+        # Upload reference IMAGES (optional, up to 30) — find the image file input
+        if self._image_paths:
+            img_uploaded = False
+            for i in range(count):
+                inp = file_inputs.nth(i)
+                accept = await inp.get_attribute("accept") or ""
+                if "image" in accept:
+                    try:
+                        await inp.set_input_files([str(p) for p in self._image_paths])
+                        await self._log("info", f"{len(self._image_paths)} reference image(s) uploaded to input #{i}")
+                        img_uploaded = True
+                        break
+                    except Exception:
+                        continue
+            if not img_uploaded and count > 1:
+                # try the second input (first was video)
+                try:
+                    await file_inputs.nth(1).set_input_files([str(p) for p in self._image_paths])
+                    await self._log("info", f"{len(self._image_paths)} reference image(s) uploaded (input #1)")
+                    img_uploaded = True
+                except Exception:
+                    pass
+            if not img_uploaded:
+                await self._log("warn", "could not find a separate image upload input — images may not have been uploaded")
         await human_delay(1, 2)
         ok = await fill_any(self.page, prompt, ['textarea[name="prompt"]',
             'textarea[placeholder*="prompt" i]', 'textarea[placeholder*="describe" i]',
