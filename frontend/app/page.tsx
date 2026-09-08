@@ -10,11 +10,10 @@ import History, { type HistoryItem } from '@/components/History';
 import { cn, ts } from '@/lib/utils';
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || '';
 const DEFAULT_PROMPT = 'A cyberpunk samurai walking through neon Tokyo streets at night, dramatic lighting, cinematic';
 const MIN_DURATION = 4;
 const MAX_DURATION = 30;
-
-const NAV_LINKS = ['Explore','Image','Video','Audio','Edit','Cinema Studio 4.0','Marketing Studio','3D Jutsu','MCP & CLI','Supercomputer','Academy','Viral Presets','Community','Contests','Plugins','Canvas'];
 
 export default function Page() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -33,10 +32,20 @@ export default function Page() {
   const [videoName, setVideoName] = useState<string | undefined>(undefined);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [mainTab, setMainTab] = useState<'history' | 'library' | 'how'>('library');
+  const [proxies, setProxies] = useState<string>('');
+  const [proxyCount, setProxyCount] = useState<number>(0);
+  const [showProxyPanel, setShowProxyPanel] = useState(false);
+  const [proxySaving, setProxySaving] = useState(false);
   const esRef = useRef<EventSource | null>(null);
 
+  // Load proxies from backend on mount
   useEffect(() => {
     try { const raw = localStorage.getItem('genjutsu-history'); if (raw) setHistory(JSON.parse(raw)); } catch {}
+    // Fetch current proxy count from backend
+    fetch(`${BACKEND}/proxies`, { headers: API_KEY ? { 'X-API-Key': API_KEY } : {} })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) { setProxyCount(d.count || 0); } })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -82,9 +91,8 @@ export default function Page() {
       pushLog('ok', `job accepted: ${jobId}`);
 
       // SSE doesn't support custom headers — append API key as query param if set
-      const apiKey = process.env.NEXT_PUBLIC_API_KEY || '';
-      const streamUrl = apiKey
-        ? `${BACKEND}/jobs/${jobId}/stream?api_key=${encodeURIComponent(apiKey)}`
+      const streamUrl = API_KEY
+        ? `${BACKEND}/jobs/${jobId}/stream?api_key=${encodeURIComponent(API_KEY)}`
         : `${BACKEND}/jobs/${jobId}/stream`;
       const es = new EventSource(streamUrl);
       esRef.current = es;
@@ -92,8 +100,8 @@ export default function Page() {
       es.addEventListener('progress', (e) => setProgress(Number((e as MessageEvent).data)));
       es.addEventListener('done', (e) => {
         const d = JSON.parse((e as MessageEvent).data);
-        const vurl = apiKey
-          ? `${BACKEND}/jobs/${jobId}/video?api_key=${encodeURIComponent(apiKey)}`
+        const vurl = API_KEY
+          ? `${BACKEND}/jobs/${jobId}/video?api_key=${encodeURIComponent(API_KEY)}`
           : `${BACKEND}/jobs/${jobId}/video`;
         setVideoUrl(vurl); setVideoName(d.fileName || 'genjutsu.mp4'); setProgress(100);
         pushLog('ok', 'generation complete');
@@ -105,24 +113,75 @@ export default function Page() {
     } catch (e: any) { pushLog('err', e.message || 'unknown error'); setBusy(false); }
   };
 
+  const saveProxies = async () => {
+    setProxySaving(true);
+    try {
+      const r = await fetch(`${BACKEND}/proxies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(API_KEY ? { 'X-API-Key': API_KEY } : {}) },
+        body: JSON.stringify({ proxies: proxies.split(',').map(p => p.trim()).filter(Boolean) }),
+      });
+      if (r.ok) { const d = await r.json(); setProxyCount(d.count || 0); pushLog('ok', `proxies updated: ${d.count} active`); }
+      else { const e = await r.text(); pushLog('err', `proxy update failed: ${e}`); }
+    } catch (e: any) { pushLog('err', e.message); }
+    setProxySaving(false);
+  };
+
   return (
     <div className="min-h-screen bg-ink text-zinc-100">
-      <nav className="sticky top-0 z-50 border-b border-zinc-800 bg-ink/95 backdrop-blur">
-        <div className="flex items-center gap-1 px-4 py-2 text-xs">
-          {NAV_LINKS.map((link) => (
-            <span key={link} className={cn('whitespace-nowrap rounded px-2 py-1 font-medium transition-colors', link === 'Video' ? 'bg-lime/20 text-lime' : 'text-zinc-400 hover:text-zinc-200')}>
-              {link}{link === '3D Jutsu' && <sup className="ml-0.5 text-[8px] text-lime">New</sup>}
-            </span>
-          ))}
-          <div className="ml-auto flex items-center gap-3">
-            <span className="rounded bg-rose-600/20 px-2 py-0.5 text-[10px] font-bold text-rose-400">55% OFF</span>
-            <span className="text-zinc-400 hover:text-zinc-200">Pricing</span>
-            <span className="text-zinc-400 hover:text-zinc-200">Enterprise</span>
-            <span className="text-zinc-400 hover:text-zinc-200">Assets</span>
+      {/* Minimal header — no nav buttons */}
+      <header className="sticky top-0 z-50 border-b border-zinc-800 bg-ink/95 backdrop-blur">
+        <div className="flex items-center justify-between px-4 py-2.5">
+          <div className="flex items-center gap-2">
+            <div className="h-7 w-7 rounded-lg bg-grad-neon" />
+            <span className="text-sm font-bold tracking-wide text-higyel">HIGGSFIELD GENJUTSU</span>
+            <span className="text-xs text-zinc-600">UNLIMITED</span>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setShowProxyPanel(!showProxyPanel)}
+              className={cn('rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors',
+                showProxyPanel ? 'border-lime bg-lime/10 text-lime' : 'border-zinc-700 text-zinc-400 hover:text-zinc-200')}
+            >
+              ⚙ Proxies ({proxyCount})
+            </button>
             <div className="h-7 w-7 rounded-full bg-grad-neon" />
           </div>
         </div>
-      </nav>
+      </header>
+
+      {/* Proxy settings panel (collapsible) */}
+      {showProxyPanel && (
+        <div className="border-b border-zinc-800 bg-panel/60 p-4">
+          <div className="mx-auto max-w-3xl">
+            <h3 className="mb-2 text-sm font-bold text-zinc-200">Proxy Settings</h3>
+            <p className="mb-2 text-xs text-zinc-500">
+              Add residential proxies (comma-separated). Each new account gets a fresh IP from this pool.
+              Use <code className="text-lime">socks5h://</code> for DNS-over-proxy (prevents DNS leak).
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={proxies}
+                onChange={(e) => setProxies(e.target.value)}
+                placeholder="socks5h://user:pass@host:port,socks5h://user2:pass2@host2:port2"
+                className="flex-1 rounded-lg border border-zinc-700 bg-panel2 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-lime"
+              />
+              <button
+                onClick={saveProxies}
+                disabled={proxySaving || !proxies.trim()}
+                className={cn('rounded-lg px-4 py-2 text-sm font-bold transition-all',
+                  proxies.trim() && !proxySaving ? 'bg-grad-lime text-black hover:shadow-lime' : 'bg-zinc-800 text-zinc-500 cursor-not-allowed')}
+              >
+                {proxySaving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-zinc-600">
+              Active proxies: {proxyCount}. Each generation creates a fresh account on the next proxy in the rotation = fresh IP every time.
+            </p>
+          </div>
+        </div>
+      )}
 
       <div className="mx-auto flex max-w-[1600px] gap-0">
         <aside className="w-[360px] shrink-0 border-r border-zinc-800 bg-panel/40 p-4">

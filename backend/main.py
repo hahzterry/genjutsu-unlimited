@@ -242,6 +242,33 @@ async def health():
     return {"status": "ok", "jobs": len(JOBS), "workers": MAX_WORKERS}
 
 
+# ===== Proxy management (runtime updates from UI) =====
+
+@app.get("/proxies")
+async def get_proxies():
+    from creator import PROXY_POOL
+    return {"count": PROXY_POOL.size, "proxies": [f"{p.split('@')[0]}@***" for p in PROXY_POOL.proxies]}
+
+
+@app.post("/proxies")
+async def set_proxies(request: Request):
+    if API_KEY:
+        qkey = request.query_params.get("api_key", "") or request.headers.get("X-API-Key", "")
+        if qkey != API_KEY:
+            raise HTTPException(401, "invalid or missing API key")
+    body = await request.json()
+    new_proxies = body.get("proxies", [])
+    if not isinstance(new_proxies, list):
+        raise HTTPException(400, "proxies must be a list of strings")
+    # Update the runtime proxy pool
+    from creator import PROXY_POOL
+    PROXY_POOL.proxies = new_proxies
+    PROXY_POOL._idx = 0
+    PROXY_POOL._failures.clear()
+    log.info(f"proxy pool updated: {len(new_proxies)} proxies")
+    return {"count": len(new_proxies), "status": "updated"}
+
+
 @app.post("/generate")
 async def generate(
     video: UploadFile = File(...),
