@@ -1,0 +1,3 @@
+docs: rewrite README with the Render deploy guide and the fix list
+
+Also drop the commit-message scratch file that was committed by mistake.
