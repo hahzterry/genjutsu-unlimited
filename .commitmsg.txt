@@ -1,0 +1,52 @@
+fix: make the build work and deploy as one free Render service
+
+The upstream repo could not build or run. This fixes the blockers and
+restructures the deploy so it fits Render's free tier.
+
+Backend
+- Add the Chromium flags a container needs: --no-sandbox (root cannot use user
+  namespaces), --disable-dev-shm-usage (/dev/shm is 64MB in Docker), plus
+  renderer memory caps. Without these Chromium never starts on Render.
+- Preserve the upload file extension. Playwright derives the multipart
+  Content-Type from it, so an extensionless temp file was sent as
+  application/octet-stream and rejected by Higgsfield.
+- Default MAX_WORKERS to 1. Each worker is a whole Chromium; more than one
+  OOMs a 512MB instance.
+- Serve the statically-exported Next.js frontend from FastAPI so this deploys
+  as ONE service: no CORS, no second host, no backend URL to keep in sync.
+- Only gate /generate, /jobs, /proxies and /stats behind the API key, so the UI
+  can always load and ask the user for the key.
+- Replace the deprecated on_event startup with a lifespan context manager.
+- Fix an unbound local in human_click and delete the dead ProxyPool class that
+  shadowed ProxyManager and never matched its own callers.
+
+Temp mail
+- Create the httpx client lazily so a retry after close() can still poll.
+- Fetch mail.tm domains from the API instead of hardcoding mail.tm, which the
+  API rejects outright.
+- Flatten mail.tm's html fragments and add staged verification-link extraction.
+
+Frontend
+- Switch to output: export. This removes the Next API route, which static
+  export cannot contain, so uploads now POST straight to the same origin.
+- Add an optional API key prompt driven by GET /config, stored in localStorage.
+- Add an app icon.
+
+Build
+- Multi-stage Dockerfile: build the Next export, then serve it from Python.
+- Pin both base images to Debian bookworm. A floating python:3.11-slim silently
+  moved to trixie, which made `playwright install --with-deps` fall back to
+  ubuntu20.04 packages and die on ttf-unifont. Pinning makes it reproducible.
+- Bump Playwright 1.45.0 to 1.63.0. 1.45 shipped Chromium 127 (Aug 2024); 1.63
+  ships Chromium 153, which matters directly for bot-detection evasion.
+- Honour $PORT and run a single uvicorn worker.
+
+Tooling
+- Replace stress_test.py, which imported an API that never existed and could
+  not even be imported, with test_backend.py: 46 checks covering proxy parsing
+  and rotation, link extraction, the account lifecycle and the HTTP API.
+- Add check_browser.py to prove Chromium launches on the deploy host.
+
+Verified on a clean x86_64 Ubuntu 24.04 VM: image builds, container serves the
+UI, Chromium 153 launches inside a 512MB cgroup, and test_backend.py passes
+46/46 inside the container.

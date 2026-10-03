@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import VideoUploadZone from '@/components/VideoUploadZone';
 import ImageUploadZone from '@/components/ImageUploadZone';
 import ModeSelector, { type Mode } from '@/components/ModeSelector';
@@ -8,9 +8,15 @@ import LogPanel, { type LogLine } from '@/components/LogPanel';
 import VideoPlayer from '@/components/VideoPlayer';
 import History, { type HistoryItem } from '@/components/History';
 import { cn, ts } from '@/lib/utils';
+import {
+  apiFetch,
+  fetchConfig,
+  getApiKey,
+  setApiKey,
+  streamUrl,
+  videoUrl,
+} from '@/lib/api';
 
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || '';
 const DEFAULT_PROMPT = 'A cyberpunk samurai walking through neon Tokyo streets at night, dramatic lighting, cinematic';
 const MIN_DURATION = 4;
 const MAX_DURATION = 30;
@@ -28,7 +34,7 @@ export default function Page() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [logs, setLogs] = useState<LogLine[]>([]);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [videoUrlState, setVideoUrlState] = useState<string | null>(null);
   const [videoName, setVideoName] = useState<string | undefined>(undefined);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [mainTab, setMainTab] = useState<'history' | 'library' | 'how'>('library');
@@ -36,17 +42,49 @@ export default function Page() {
   const [proxyCount, setProxyCount] = useState<number>(0);
   const [showProxyPanel, setShowProxyPanel] = useState(false);
   const [proxySaving, setProxySaving] = useState(false);
+  // API key prompt — only shown when the backend reports API_KEY is set.
+  const [authRequired, setAuthRequired] = useState(false);
+  const [keyInput, setKeyInput] = useState('');
+  const [keySaved, setKeySaved] = useState(false);
   const esRef = useRef<EventSource | null>(null);
 
-  // Load proxies from backend on mount
-  useEffect(() => {
-    try { const raw = localStorage.getItem('genjutsu-history'); if (raw) setHistory(JSON.parse(raw)); } catch {}
-    // Fetch current proxy count from backend
-    fetch(`${BACKEND}/proxies`, { headers: API_KEY ? { 'X-API-Key': API_KEY } : {} })
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { if (d) { setProxyCount(d.count || 0); } })
-      .catch(() => {});
+  const pushLog = useCallback(
+    (level: LogLine['level'], msg: string) => setLogs((l) => [...l, { t: ts(), level, msg }]),
+    [],
+  );
+
+  const refreshProxyCount = useCallback(async () => {
+    try {
+      const r = await apiFetch('/proxies');
+      if (!r.ok) return;
+      const d = await r.json();
+      setProxyCount(d.total ?? d.count ?? 0);
+    } catch {
+      /* backend asleep or unreachable */
+    }
   }, []);
+
+  // On mount: restore history, discover whether a key is needed, load proxies.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('genjutsu-history');
+      if (raw) setHistory(JSON.parse(raw));
+    } catch {
+      /* corrupt history — ignore */
+    }
+
+    (async () => {
+      const cfg = await fetchConfig();
+      if (cfg) {
+        setAuthRequired(cfg.authRequired);
+        setKeySaved(!cfg.authRequired || getApiKey().length > 0);
+      } else {
+        // Older backend without /config — assume no auth.
+        setKeySaved(true);
+      }
+      await refreshProxyCount();
+    })();
+  }, [refreshProxyCount]);
 
   useEffect(() => {
     if (!videoFile) { setVideoPreview(null); setVideoDuration(null); return; }
@@ -68,15 +106,21 @@ export default function Page() {
     else setVideoError(null);
   };
 
-  const pushLog = (level: LogLine['level'], msg: string) => setLogs((l) => [...l, { t: ts(), level, msg }]);
   const stopStream = () => { esRef.current?.close(); esRef.current = null; };
 
   const canGenerate = !!videoFile && !videoError && videoDuration !== null &&
-    videoDuration >= MIN_DURATION && videoDuration <= MAX_DURATION && !busy;
+    videoDuration >= MIN_DURATION && videoDuration <= MAX_DURATION && !busy && keySaved;
+
+  const saveKey = () => {
+    setApiKey(keyInput.trim());
+    setKeySaved(!!keyInput.trim() || !authRequired);
+    pushLog('ok', 'api key saved');
+    refreshProxyCount();
+  };
 
   const generate = async () => {
     if (!canGenerate) { pushLog('err', 'add a valid reference video (4–30s) first'); return; }
-    setBusy(true); setProgress(0); setLogs([]); setVideoUrl(null);
+    setBusy(true); setProgress(0); setLogs([]); setVideoUrlState(null);
     pushLog('info', 'starting generation…');
     try {
       const form = new FormData();
@@ -85,45 +129,53 @@ export default function Page() {
       form.append('prompt', promptEnabled ? prompt : '');
       form.append('mode', mode);
       pushLog('info', 'uploading reference video + images to backend…');
-      const res = await fetch('/api/generate', { method: 'POST', body: form });
-      if (!res.ok) { const e = await res.json().catch(() => ({ error: 'upload failed' })); throw new Error(e.error || 'upload failed'); }
+      const res = await apiFetch('/generate', { method: 'POST', body: form });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({ error: 'upload failed' }));
+        throw new Error(e.error || e.detail || 'upload failed');
+      }
       const { jobId } = await res.json();
       pushLog('ok', `job accepted: ${jobId}`);
 
-      // SSE doesn't support custom headers — append API key as query param if set
-      const streamUrl = API_KEY
-        ? `${BACKEND}/jobs/${jobId}/stream?api_key=${encodeURIComponent(API_KEY)}`
-        : `${BACKEND}/jobs/${jobId}/stream`;
-      const es = new EventSource(streamUrl);
+      const es = new EventSource(streamUrl(jobId));
       esRef.current = es;
       es.addEventListener('log', (e) => { const d = JSON.parse((e as MessageEvent).data); pushLog(d.level, d.msg); });
       es.addEventListener('progress', (e) => setProgress(Number((e as MessageEvent).data)));
       es.addEventListener('done', (e) => {
         const d = JSON.parse((e as MessageEvent).data);
-        const vurl = API_KEY
-          ? `${BACKEND}/jobs/${jobId}/video?api_key=${encodeURIComponent(API_KEY)}`
-          : `${BACKEND}/jobs/${jobId}/video`;
-        setVideoUrl(vurl); setVideoName(d.fileName || 'genjutsu.mp4'); setProgress(100);
+        const vurl = videoUrl(jobId);
+        setVideoUrlState(vurl); setVideoName(d.fileName || 'genjutsu.mp4'); setProgress(100);
         pushLog('ok', 'generation complete');
         const item: HistoryItem = { id: jobId, createdAt: Date.now(), prompt, thumbUrl: videoPreview, videoUrl: vurl };
         setHistory((h) => { const next = [item, ...h].slice(0, 50); localStorage.setItem('genjutsu-history', JSON.stringify(next)); return next; });
         stopStream(); setBusy(false);
       });
       es.addEventListener('error', () => { pushLog('err', 'stream error — backend may have crashed'); stopStream(); setBusy(false); });
-    } catch (e: any) { pushLog('err', e.message || 'unknown error'); setBusy(false); }
+    } catch (e: unknown) {
+      pushLog('err', e instanceof Error ? e.message : 'unknown error');
+      setBusy(false);
+    }
   };
 
   const saveProxies = async () => {
     setProxySaving(true);
     try {
-      const r = await fetch(`${BACKEND}/proxies`, {
+      const r = await apiFetch('/proxies', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(API_KEY ? { 'X-API-Key': API_KEY } : {}) },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ proxies: proxies.split(',').map(p => p.trim()).filter(Boolean) }),
       });
-      if (r.ok) { const d = await r.json(); setProxyCount(d.count || 0); pushLog('ok', `proxies updated: ${d.count} active`); }
-      else { const e = await r.text(); pushLog('err', `proxy update failed: ${e}`); }
-    } catch (e: any) { pushLog('err', e.message); }
+      if (r.ok) {
+        const d = await r.json();
+        setProxyCount(d.count || 0);
+        pushLog('ok', `proxies updated: ${d.count} active`);
+      } else {
+        const e = await r.text();
+        pushLog('err', `proxy update failed: ${e}`);
+      }
+    } catch (e: unknown) {
+      pushLog('err', e instanceof Error ? e.message : 'proxy update failed');
+    }
     setProxySaving(false);
   };
 
@@ -143,42 +195,72 @@ export default function Page() {
               className={cn('rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors',
                 showProxyPanel ? 'border-lime bg-lime/10 text-lime' : 'border-zinc-700 text-zinc-400 hover:text-zinc-200')}
             >
-              ⚙ Proxies ({proxyCount})
+              Proxies ({proxyCount})
             </button>
             <div className="h-7 w-7 rounded-full bg-grad-neon" />
           </div>
         </div>
       </header>
 
-      {/* Proxy settings panel (collapsible) */}
+      {/* Proxy + API key settings panel (collapsible) */}
       {showProxyPanel && (
         <div className="border-b border-zinc-800 bg-panel/60 p-4">
-          <div className="mx-auto max-w-3xl">
-            <h3 className="mb-2 text-sm font-bold text-zinc-200">Proxy Settings</h3>
-            <p className="mb-2 text-xs text-zinc-500">
-              Add residential proxies. Format: <code className="text-lime">IP:PORT:USERNAME:PASSWORD</code> (one per line or comma-separated).
-              Each new account gets a fresh IP from the pool.
-            </p>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={proxies}
-                onChange={(e) => setProxies(e.target.value)}
-                placeholder="thehub.proxy-cheap.com:8080:kqIUSOsHDdfv2rp:FGUWRrIgSbjIODo"
-                className="flex-1 rounded-lg border border-zinc-700 bg-panel2 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-lime"
-              />
-              <button
-                onClick={saveProxies}
-                disabled={proxySaving || !proxies.trim()}
-                className={cn('rounded-lg px-4 py-2 text-sm font-bold transition-all',
-                  proxies.trim() && !proxySaving ? 'bg-grad-lime text-black hover:shadow-lime' : 'bg-zinc-800 text-zinc-500 cursor-not-allowed')}
-              >
-                {proxySaving ? 'Saving…' : 'Save'}
-              </button>
+          <div className="mx-auto max-w-3xl space-y-4">
+            {authRequired && (
+              <div>
+                <h3 className="mb-2 text-sm font-bold text-zinc-200">API Key</h3>
+                <p className="mb-2 text-xs text-zinc-500">
+                  This backend was started with <code className="text-lime">API_KEY</code> set, so jobs
+                  require the key. Paste it once — it is kept in this browser only.
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={keyInput}
+                    onChange={(e) => setKeyInput(e.target.value)}
+                    placeholder="X-API-Key value"
+                    className="flex-1 rounded-lg border border-zinc-700 bg-panel2 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-lime"
+                  />
+                  <button
+                    onClick={saveKey}
+                    disabled={!keyInput.trim()}
+                    className={cn('rounded-lg px-4 py-2 text-sm font-bold transition-all',
+                      keyInput.trim() ? 'bg-grad-lime text-black hover:shadow-lime' : 'bg-zinc-800 text-zinc-500 cursor-not-allowed')}
+                  >
+                    Save
+                  </button>
+                </div>
+                {keySaved && <p className="mt-2 text-xs text-emerald-400">key stored</p>}
+              </div>
+            )}
+
+            <div>
+              <h3 className="mb-2 text-sm font-bold text-zinc-200">Proxy Settings</h3>
+              <p className="mb-2 text-xs text-zinc-500">
+                Add residential proxies. Format: <code className="text-lime">IP:PORT:USERNAME:PASSWORD</code> (one per line or comma-separated).
+                Each new account gets a fresh IP from the pool.
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={proxies}
+                  onChange={(e) => setProxies(e.target.value)}
+                  placeholder="host.example.com:8080:username:password"
+                  className="flex-1 rounded-lg border border-zinc-700 bg-panel2 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-lime"
+                />
+                <button
+                  onClick={saveProxies}
+                  disabled={proxySaving || !proxies.trim()}
+                  className={cn('rounded-lg px-4 py-2 text-sm font-bold transition-all',
+                    proxies.trim() && !proxySaving ? 'bg-grad-lime text-black hover:shadow-lime' : 'bg-zinc-800 text-zinc-500 cursor-not-allowed')}
+                >
+                  {proxySaving ? 'Saving…' : 'Save'}
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-zinc-600">
+                Active proxies: {proxyCount}. Each generation creates a fresh account on the next proxy in the rotation = fresh IP every time.
+              </p>
             </div>
-            <p className="mt-2 text-xs text-zinc-600">
-              Active proxies: {proxyCount}. Each generation creates a fresh account on the next proxy in the rotation = fresh IP every time.
-            </p>
           </div>
         </div>
       )}
@@ -256,18 +338,18 @@ export default function Page() {
           {mainTab === 'history' && (
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
               <div className="space-y-4">
-                <VideoPlayer url={videoUrl} fileName={videoName} />
+                <VideoPlayer url={videoUrlState} fileName={videoName} />
                 <LogPanel logs={logs} />
               </div>
-              <History items={history} onPick={(h) => { setVideoUrl(h.videoUrl); setPrompt(h.prompt); }} />
+              <History items={history} onPick={(h) => { setVideoUrlState(h.videoUrl); setPrompt(h.prompt); }} />
             </div>
           )}
 
           {mainTab === 'library' && (
             <div className="flex flex-col items-center justify-center">
-              {videoUrl ? (
+              {videoUrlState ? (
                 <div className="w-full max-w-2xl space-y-4">
-                  <VideoPlayer url={videoUrl} fileName={videoName} />
+                  <VideoPlayer url={videoUrlState} fileName={videoName} />
                   <LogPanel logs={logs} />
                 </div>
               ) : busy ? (

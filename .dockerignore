@@ -1,0 +1,47 @@
+# Keep the build context small and prevent host artifacts leaking into the image.
+
+# Git + editor
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Node — stage 1 runs `npm ci`, so host modules/build output are never wanted
+node_modules
+frontend/node_modules
+frontend/.next
+frontend/out
+npm-debug.log*
+yarn-error.log*
+
+# Runtime state — never bake a database or media into an image
+*.db
+*.db-journal
+accounts.db
+videos/
+uploads/
+static/
+debug/
+
+# Local-only helpers and generated output
+# test_backend.py is intentionally NOT excluded: it is useful to run inside
+# the container (Render shell) to verify Chromium launches with the right flags.
+desktop/
+docs/
+deploy-everything.sh
+.history
+.DS_Store
+
+# Env files stay out of the image; Render injects env vars instead
+.env
+.env.*
+!.env.example

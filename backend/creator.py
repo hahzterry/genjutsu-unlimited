@@ -35,7 +35,28 @@ DEBUG_DIR = Path(os.getenv("DEBUG_DIR", "/tmp/debug")); DEBUG_DIR.mkdir(parents=
 VIDEO_DIR = Path(os.getenv("VIDEO_DIR", "/tmp/videos")); VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 PROXY_LIST = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "300"))
+RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "900"))
+
+# Container-safe Chromium flags. Inside Docker (Render/Railway/Fly) Chromium
+# will not start without --no-sandbox (no user namespaces for root) and it
+# crashes randomly without --disable-dev-shm-usage (/dev/shm is only 64 MB).
+# The remaining flags cap renderer memory so a 512 MB instance survives.
+BROWSER_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+    "--disable-features=TranslateUI",
+    "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=256",
+]
 
 # --- Anti-detection config (v4.1 — mass mode, no throttling) ---
 # Natural human-like delays (fast but not robotic)
@@ -45,45 +66,9 @@ MAX_ACTION_DELAY = float(os.getenv("MAX_ACTION_DELAY", "2.0"))
 STEALTH_MODE = False  # always fast mode
 
 
-class ProxyPool:
-    """Rotates proxies round-robin so every new account gets a fresh IP.
-    Tracks failures and skips dead proxies. No per-IP rate limit — mass mode.
-    """
-    def __init__(self, proxies: list[str]):
-        self.proxies = proxies
-        self._idx = 0
-        self._failures: dict[str, int] = {}
-        self._lock = asyncio.Lock()
-
-    async def next(self) -> Optional[str]:
-        if not self.proxies:
-            return None
-        async with self._lock:
-            for _ in range(len(self.proxies)):
-                p = self.proxies[self._idx % len(self.proxies)]
-                self._idx += 1
-                if self._failures.get(p, 0) < 3:
-                    return p
-            return min(self.proxies, key=lambda p: self._failures.get(p, 0))
-
-    async def record_failure(self, proxy: str):
-        async with self._lock:
-            self._failures[proxy] = self._failures.get(proxy, 0) + 1
-
-    async def reset(self, proxy: str):
-        async with self._lock:
-            self._failures.pop(proxy, None)
-
-    @property
-    def size(self) -> int:
-        return len(self.proxies)
-
-    def update_proxies(self, new_proxies: list[str]):
-        self.proxies = new_proxies
-        self._idx = 0
-        self._failures.clear()
-
-
+# ProxyPool was removed: ProxyManager (proxy_manager.py) is the single source of
+# truth for rotation, cooldowns and failure tracking. Two competing pools with
+# different signatures was the source of several import-time failures.
 PROXY_POOL = ProxyManager(load_proxy_list())
 
 # Global delay between new account creations (90-180s)
@@ -163,6 +148,7 @@ class HumanInput:
 
     @staticmethod
     async def human_click(page, selector):
+        el = None
         try:
             el = page.locator(selector).first
             box = await el.bounding_box()
@@ -420,8 +406,7 @@ class HiggsfieldCreator:
 
         await self._log("info", f"launching browser (proxy={'yes' if self.proxy else 'no'}, pool={PROXY_POOL.size}, tz={proxy_tz})")
         self._pw = await async_playwright().start()
-        launch_args = {"headless": HEADLESS,
-                       "args": ["--disable-blink-features=AutomationControlled"]}
+        launch_args = {"headless": HEADLESS, "args": list(BROWSER_ARGS)}
         if self.proxy: launch_args["proxy"] = {"server": self.proxy}
         self.browser = await self._pw.chromium.launch(**launch_args)
         self.ctx = await self.browser.new_context(
@@ -630,6 +615,3 @@ class HiggsfieldCreator:
         self.ctx = self.page = None
         if hasattr(self, "browser"): self.browser = None
         if hasattr(self, "_pw"): self._pw = None
-
-
-

@@ -1,0 +1,49 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploy: Render dashboard -> New + -> Blueprint -> pick this repo -> Apply.
+# Render reads this file, builds ./Dockerfile, and creates ONE free web service
+# that serves both the UI and the API.
+#
+# Why one service and not two:
+#   Render's free plan gives 750 instance-hours per MONTH across all free
+#   services. A single always-on service burns ~730 of those. A second free
+#   service (the old Vercel-style frontend split) would push the total past the
+#   limit and Render would suspend one of them. So the Next.js frontend is
+#   statically exported and served by FastAPI from the same container.
+
+services:
+  - type: web
+    name: genjutsu-unlimited
+    runtime: docker
+    plan: free
+    region: frankfurt          # closest free region to Almaty; switch to oregon/ohio/singapore if you prefer
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      # --- Browser ---
+      - key: HEADLESS
+        value: "true"
+      # Each worker is a whole Chromium (~250-400 MB). 1 is the maximum that
+      # fits in a 512 MB instance. Raise this only after upgrading the plan.
+      - key: MAX_WORKERS
+        value: "1"
+      # Whole-job ceiling: signup + inbox wait + generation + download.
+      - key: RUN_TIMEOUT
+        value: "900"
+      # Keep finished jobs (and their mp4s) for an hour.
+      - key: JOB_TTL
+        value: "3600"
+
+      # --- Optional: set these in the Render dashboard, not in git ---
+      # Residential proxies, comma-separated. Without them Higgsfield sees a
+      # datacenter IP and will usually serve a Cloudflare challenge.
+      # Format: host:port:user:pass  or  socks5h://user:pass@host:port
+      - key: PROXY_LIST
+        sync: false
+      # If set, the UI asks for this key once and stores it in the browser.
+      # Leave empty (blank in the dashboard) to run with no auth.
+      - key: API_KEY
+        sync: false

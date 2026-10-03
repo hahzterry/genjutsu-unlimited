@@ -4,5 +4,10 @@ httpx==0.27.0
 aiosqlite==0.20.0
 python-dotenv==1.0.1
 python-multipart==0.0.9
-playwright==1.45.0
+# 1.45 shipped Chromium 127 (Aug 2024) and predates Debian 13, so
+# `playwright install --with-deps` fell back to ubuntu20.04 packages and died
+# on ttf-unifont / ttf-ubuntu-font-family, which no longer exist. 1.63 is
+# current: it bundles a modern Chromium (better against bot fingerprinting,
+# which is the entire point of this tool) and knows the newer distros.
+playwright==1.63.0
 pydantic==2.7.0
