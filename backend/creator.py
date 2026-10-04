@@ -370,6 +370,38 @@ class HiggsfieldCreator:
         except Exception as exc:  # noqa: BLE001 - diagnostics must never raise
             await self._log("warn", f"{tag}: could not inspect page: {exc}")
 
+    async def _dismiss_cookie_banner(self) -> bool:
+        """Accept the cookie notice so the real UI renders.
+
+        Higgsfield gates the page behind a consent dialog. Until it is
+        dismissed the DOM contains zero inputs and the body text is nothing but
+        the notice — which is exactly the state that produced
+        "email field not found on signup" with a valid URL and no Cloudflare
+        challenge.
+        """
+        sels = [
+            'button:has-text("Accept all")',
+            'button:has-text("Accept All")',
+            'button:has-text("Accept all cookies")',
+            'button:has-text("Allow all")',
+            '[role="button"]:has-text("Accept all")',
+            '#onetrust-accept-btn-handler',
+            'button:has-text("I agree")',
+            'button:has-text("Got it")',
+            'button:has-text("Accept")',
+        ]
+        for sel in sels:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.is_visible(timeout=1500):
+                    await loc.click()
+                    await human_delay(0.6, 1.4)
+                    await self._log("ok", f"dismissed cookie banner ({sel})")
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _human_scroll(self, scrolls=3):
         """Simulate human scrolling — scroll down and up randomly."""
         for _ in range(scrolls):
@@ -464,6 +496,8 @@ class HiggsfieldCreator:
             await self.page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             await self._log("info", "signup: networkidle not reached within 15s, continuing")
+        # The consent dialog covers the form until accepted.
+        await self._dismiss_cookie_banner()
         # Cloudflare detection
         if await self._detect_cloudflare():
             await self._shot("cloudflare_signup")
@@ -479,6 +513,11 @@ class HiggsfieldCreator:
         await human_delay()
         ok = await fill_any(self.page, self.email, ['input[type="email"]', 'input[name="email"]',
             'input[placeholder*="mail" i]', 'input[placeholder*="email" i]'])
+        if not ok:
+            # If the banner appeared late it can still be covering the form.
+            if await self._dismiss_cookie_banner():
+                ok = await fill_any(self.page, self.email, ['input[type="email"]', 'input[name="email"]',
+                    'input[placeholder*="mail" i]', 'input[placeholder*="email" i]'])
         if not ok:
             await self._shot("signup_no_email_field")
             await self._diagnose_page("signup_no_email_field")
