@@ -332,9 +332,12 @@ class HiggsfieldCreator:
         cf_sels = [
             'text="Checking your browser"',
             'text="Just a moment"',
-            '#cf-challenge', '.cf-turnstile',
+            'text="Verifying you are human"',
+            'text="Enable JavaScript and cookies to continue"',
+            '#cf-challenge', '.cf-turnstile', '#challenge-stage',
+            '#challenge-form', '#cf-please-wait', '#cf-wrapper',
             'iframe[src*="challenges.cloudflare.com"]',
-            '#challenge-form', '#cf-please-wait',
+            'script[src*="challenges.cloudflare.com"]',
         ]
         for sel in cf_sels:
             try:
@@ -343,6 +346,29 @@ class HiggsfieldCreator:
             except Exception:
                 continue
         return False
+
+    async def _diagnose_page(self, tag: str) -> None:
+        """Log what is actually on the page.
+
+        "field not found" is useless on its own — it could be a Cloudflare
+        interstitial, a moved route, or a client-rendered SPA that has not
+        mounted yet. This records enough to tell those apart from the log alone.
+        """
+        try:
+            title = await self.page.title()
+            url = self.page.url
+            n_inputs = await self.page.locator("input").count()
+            n_iframes = await self.page.locator("iframe").count()
+            n_textareas = await self.page.locator("textarea").count()
+            body = " ".join((await self.page.inner_text("body")).split())[:300]
+            await self._log(
+                "info",
+                f"{tag}: url={url} title={title!r} "
+                f"inputs={n_inputs} textareas={n_textareas} iframes={n_iframes}",
+            )
+            await self._log("info", f"{tag}: body starts {body!r}")
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never raise
+            await self._log("warn", f"{tag}: could not inspect page: {exc}")
 
     async def _human_scroll(self, scrolls=3):
         """Simulate human scrolling — scroll down and up randomly."""
@@ -432,12 +458,20 @@ class HiggsfieldCreator:
         self.email = await self.mail.create()
         await self._log("info", f"temp inbox ready: {self.email}")
         await self.page.goto(SIGNUP, wait_until="domcontentloaded", timeout=90000); await human_delay()
+        # The site is a client-rendered SPA: domcontentloaded fires before React
+        # has mounted the form. Best-effort wait, but never hang on it.
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            await self._log("info", "signup: networkidle not reached within 15s, continuing")
         # Cloudflare detection
         if await self._detect_cloudflare():
             await self._shot("cloudflare_signup")
+            await self._diagnose_page("cloudflare_signup")
             raise RuntimeError("Cloudflare challenge on signup — need a better proxy")
         if await detect_captcha(self.page):
             await self._shot("captcha_signup")
+            await self._diagnose_page("captcha_signup")
             raise RuntimeError("captcha on signup - needs a solver or manual solve")
         await fill_any(self.page, self.first, ['input[name="firstName"]', 'input[name="name"]',
             'input[placeholder*="first name" i]', 'input[placeholder*="name" i]'])
@@ -445,7 +479,10 @@ class HiggsfieldCreator:
         await human_delay()
         ok = await fill_any(self.page, self.email, ['input[type="email"]', 'input[name="email"]',
             'input[placeholder*="mail" i]', 'input[placeholder*="email" i]'])
-        if not ok: raise RuntimeError("email field not found on signup")
+        if not ok:
+            await self._shot("signup_no_email_field")
+            await self._diagnose_page("signup_no_email_field")
+            raise RuntimeError("email field not found on signup (see diagnose line above)")
         await human_delay()
         ok = await fill_any(self.page, self.password, ['input[type="password"]', 'input[name="password"]',
             'input[placeholder*="password" i]'])
