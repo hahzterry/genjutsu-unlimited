@@ -81,6 +81,29 @@ LANGUAGES_LIST = [["en-US","en"],["en-GB","en"],["en-AU","en"],["en-CA","en"]]
 RESOLUTIONS = [{"width":1920,"height":1080},{"width":1440,"height":900},{"width":1536,"height":864}]
 PLATFORMS = ["MacIntel","Win32","Linux x86_64"]
 
+def normalize_proxy(p: Optional[str]) -> Optional[str]:
+    """Chromium cannot use socks5h:// or SOCKS5 auth. Strip scheme, return
+    a plain 'host:port:user:pass' string. Return None if unusable."""
+    if not p:
+        return None
+    p = p.strip()
+    if "://" in p:
+        # Extract credentials and host from URL form
+        import re
+        m = re.match(r"socks5h?://([^:]+):([^@]+)@(.+)", p)
+        if m:
+            user, pw, hostport = m.groups()
+            # Only usable if the endpoint is actually HTTP; we can't tell
+            # from here, so log and skip.
+            log.warning(f"refusing socks5h proxy {hostport} — use HTTP endpoint instead")
+            return None
+        # http://user:pass@host:port → host:port:user:pass
+        m = re.match(r"https?://([^:]+):([^@]+)@(.+)", p)
+        if m:
+            user, pw, hostport = m.groups()
+            return f"{hostport}:{user}:{pw}"
+        return None
+    return p
 
 class FingerprintRandomizer:
     def __init__(self):
