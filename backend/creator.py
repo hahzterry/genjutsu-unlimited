@@ -1,6 +1,6 @@
 """HiggsfieldCreator — full invisible automation of the Higgsfield Genjutsu flow.
 
-v4.1 anti-detection upgrades:
+v4.2 anti-detection upgrades:
   - Maximum fingerprint spoofing (canvas/WebGL/audio/navigator)
   - Human-like bezier mouse movements + typing simulation
   - Configurable long delays (30-90s between actions, 5-15min between accounts)
@@ -8,6 +8,7 @@ v4.1 anti-detection upgrades:
   - Per-proxy rate limiting (max 2-3 accounts/hour per IP)
   - Stealth init scripts (webdriver, plugins, languages, hardware)
   - iframe-aware form scope resolution (Higgsfield renders auth in an iframe)
+  - normalize_proxy() actually applied at every proxy ingress point
 
 Bug fixes vs prior version:
   A: mark_used() fires right after generation (before download) — no credit leak.
@@ -18,8 +19,9 @@ Bug fixes vs prior version:
   F: overall timeout wraps the entire retry loop (configurable via RUN_TIMEOUT).
   G: proxy is bound to the account at creation and reused on every login.
   H: iframe-based signup/login forms now reachable via FrameLocator.
+  I: normalize_proxy() is applied to every proxy before it reaches Chromium.
 """
-import os, asyncio, random, logging, string as _string, math, time
+import os, asyncio, random, logging, string as _string, math, time, re
 from typing import Optional, Callable, Awaitable
 from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext, Locator, FrameLocator
@@ -35,7 +37,6 @@ CREATE = f"{HIGGS}/create"
 GENJUTSU = f"{HIGGS}/genjutsu"
 DEBUG_DIR = Path(os.getenv("DEBUG_DIR", "/tmp/debug")); DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 VIDEO_DIR = Path(os.getenv("VIDEO_DIR", "/tmp/videos")); VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-PROXY_LIST = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "900"))
 
@@ -57,15 +58,83 @@ BROWSER_ARGS = [
     "--js-flags=--max-old-space-size=256",
 ]
 
-# --- Anti-detection config (v4.1 — mass mode, no throttling) ---
 MIN_ACTION_DELAY = float(os.getenv("MIN_ACTION_DELAY", "0.5"))
 MAX_ACTION_DELAY = float(os.getenv("MAX_ACTION_DELAY", "2.0"))
 STEALTH_MODE = False
 
-PROXY_POOL = ProxyManager(load_proxy_list())
-
 GLOBAL_ACCOUNT_DELAY = float(os.getenv("GLOBAL_ACCOUNT_DELAY", "90"))
 _last_account_time = 0.0
+
+
+# ===== Proxy normalization =====
+# Chromium refuses socks5h:// entirely, and silently drops SOCKS5 auth.
+# Any proxy that reaches Playwright MUST be in plain 'host:port:user:pass'
+# form (which Playwright interprets as an HTTP proxy), or a socks5:// URL
+# with NO credentials. Everything else is stripped or rejected here so the
+# bad string never reaches the browser.
+
+_SOCKS_AUTH_RE = re.compile(r"^socks5h?://([^:]+):([^@]+)@(.+)$")
+_HTTP_AUTH_RE  = re.compile(r"^https?://([^:]+):([^@]+)@(.+)$")
+
+def normalize_proxy(p: Optional[str]) -> Optional[str]:
+    """Return a Chromium-safe proxy string, or None if the input is unusable.
+
+    Rules:
+      - 'host:port:user:pass'  → passthrough (treated as HTTP proxy)
+      - 'http(s)://u:p@h:p'    → 'h:p:u:p'
+      - 'socks5://u:p@h:p'     → refused (Chromium drops SOCKS5 auth)
+      - 'socks5h://u:p@h:p'    → refused (Chromium has no such scheme)
+      - anything else          → refused
+    """
+    if not p:
+        return None
+    p = p.strip()
+    if not p:
+        return None
+
+    if "://" in p:
+        m = _SOCKS_AUTH_RE.match(p)
+        if m:
+            _user, _pw, hostport = m.groups()
+            log.warning(
+                "refusing SOCKS proxy %s — Chromium cannot use socks5h:// "
+                "or SOCKS5 auth. Provide an HTTP endpoint in host:port:user:pass "
+                "format instead.",
+                hostport,
+            )
+            return None
+
+        m = _HTTP_AUTH_RE.match(p)
+        if m:
+            user, pw, hostport = m.groups()
+            return f"{hostport}:{user}:{pw}"
+
+        # Some other scheme (e.g. socks5:// without auth) — allow only if
+        # there are no credentials, since Chromium can handle unauthenticated
+        # SOCKS5.
+        if p.startswith("socks5://") and "@" not in p:
+            return p
+        log.warning("refusing unrecognized proxy format: %s", p.split("@")[-1])
+        return None
+
+    # Plain host:port:user:pass — the only form the UI advertises.
+    return p
+
+
+def _normalized_proxy_list():
+    raw = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
+    out = []
+    for p in raw:
+        n = normalize_proxy(p)
+        if n:
+            out.append(n)
+        else:
+            log.warning("dropping unusable proxy from PROXY_LIST: %s", p.split("@")[-1])
+    return out
+
+
+PROXY_POOL = ProxyManager(_normalized_proxy_list())
+log.info("proxy pool initialized with %d usable proxies", PROXY_POOL.size)
 
 
 # ===== FingerprintRandomizer =====
@@ -81,29 +150,6 @@ LANGUAGES_LIST = [["en-US","en"],["en-GB","en"],["en-AU","en"],["en-CA","en"]]
 RESOLUTIONS = [{"width":1920,"height":1080},{"width":1440,"height":900},{"width":1536,"height":864}]
 PLATFORMS = ["MacIntel","Win32","Linux x86_64"]
 
-def normalize_proxy(p: Optional[str]) -> Optional[str]:
-    """Chromium cannot use socks5h:// or SOCKS5 auth. Strip scheme, return
-    a plain 'host:port:user:pass' string. Return None if unusable."""
-    if not p:
-        return None
-    p = p.strip()
-    if "://" in p:
-        # Extract credentials and host from URL form
-        import re
-        m = re.match(r"socks5h?://([^:]+):([^@]+)@(.+)", p)
-        if m:
-            user, pw, hostport = m.groups()
-            # Only usable if the endpoint is actually HTTP; we can't tell
-            # from here, so log and skip.
-            log.warning(f"refusing socks5h proxy {hostport} — use HTTP endpoint instead")
-            return None
-        # http://user:pass@host:port → host:port:user:pass
-        m = re.match(r"https?://([^:]+):([^@]+)@(.+)", p)
-        if m:
-            user, pw, hostport = m.groups()
-            return f"{hostport}:{user}:{pw}"
-        return None
-    return p
 
 class FingerprintRandomizer:
     def __init__(self):
@@ -197,8 +243,12 @@ async def human_delay(lo=None, hi=None):
     else:
         await asyncio.sleep(random.uniform(MIN_ACTION_DELAY, MAX_ACTION_DELAY))
 
+
 async def pick_proxy() -> Optional[str]:
-    return await PROXY_POOL.next()
+    """Get next proxy from pool, normalized for Chromium."""
+    raw = await PROXY_POOL.next()
+    return normalize_proxy(raw)
+
 
 async def global_account_delay():
     global _last_account_time
@@ -220,11 +270,6 @@ def random_name() -> tuple[str, str]:
 
 
 async def click_any(scope, selectors, timeout=15000) -> bool:
-    """Click first matching selector within scope.
-
-    `scope` may be a Page, Frame, or FrameLocator. All three expose
-    .locator(), so this works uniformly.
-    """
     for sel in selectors:
         try:
             loc = scope.locator(sel).first
@@ -235,7 +280,6 @@ async def click_any(scope, selectors, timeout=15000) -> bool:
     return False
 
 async def fill_any(scope, value, selectors, timeout=15000) -> bool:
-    """Fill first matching selector within scope. Same scope rules as click_any."""
     for sel in selectors:
         try:
             loc = scope.locator(sel).first
@@ -364,12 +408,6 @@ class HiggsfieldCreator:
         return False
 
     async def _diagnose_page(self, tag: str) -> None:
-        """Log what is actually on the page, including per-frame contents.
-
-        `inputs=0 iframes=1` was previously indistinguishable from a blank
-        page. Now we walk every frame and report its URL and input count,
-        which immediately reveals whether the form lives in an iframe.
-        """
         try:
             title = await self.page.title()
             url = self.page.url
@@ -383,7 +421,6 @@ class HiggsfieldCreator:
                 f"inputs={n_inputs} textareas={n_textareas} iframes={n_iframes}",
             )
             await self._log("info", f"{tag}: body starts {body!r}")
-            # Per-frame diagnostics — this is what was missing before.
             for i, frame in enumerate(self.page.frames):
                 if frame == self.page.main_frame:
                     continue
@@ -401,12 +438,6 @@ class HiggsfieldCreator:
             await self._log("warn", f"{tag}: could not inspect page: {exc}")
 
     async def _dismiss_cookie_banner(self, scope=None) -> bool:
-        """Accept the cookie notice. Checks both page root and iframe scope.
-
-        Higgsfield has served the consent dialog both at the top level and,
-        more recently, inside the same iframe as the auth form. Checking both
-        keeps this working regardless of where it is.
-        """
         sels = [
             'button:has-text("Accept all")',
             'button:has-text("Accept All")',
@@ -441,24 +472,11 @@ class HiggsfieldCreator:
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
     async def _form_scope(self, tag: str = "form"):
-        """Return a scope capable of seeing the signup/login form.
-
-        Higgsfield's auth form is rendered inside a cross-origin iframe.
-        `page.locator()` cannot cross that boundary; `page.frame_locator()`
-        can. This picks the first iframe that actually contains an <input>,
-        which distinguishes the form iframe from analytics/Cloudflare iframes.
-
-        Returns:
-            A FrameLocator if a form iframe was found, otherwise the Page.
-        """
-        # Give late-mounted iframes a chance.
         try:
             await self.page.wait_for_selector("iframe", timeout=15000)
         except Exception:
             await self._log("warn", f"{tag}: no iframe appeared within 15s")
 
-        # Prefer selectors that name common auth providers, in case the
-        # page ever has multiple iframes.
         candidates = [
             'iframe[src*="auth"]',
             'iframe[src*="signup"]',
@@ -478,7 +496,6 @@ class HiggsfieldCreator:
                 if await loc.count() == 0:
                     continue
                 fl = self.page.frame_locator(sel).first
-                # Sanity check: does this frame actually contain inputs?
                 try:
                     n = await fl.locator("input").count()
                 except Exception:
@@ -489,7 +506,6 @@ class HiggsfieldCreator:
             except Exception:
                 continue
 
-        # Fallback: iterate raw frames (handles nested / unlabeled iframes)
         for i, frame in enumerate(self.page.frames):
             if frame == self.page.main_frame:
                 continue
@@ -544,7 +560,17 @@ class HiggsfieldCreator:
         acct = await get_account_with_credits()
         if acct:
             self.email = acct["email"]; self.password = acct["password"]
-            self.proxy = acct.get("proxy")
+            # Normalize the stored proxy too — accounts may have been saved
+            # with the old socks5h:// format.
+            raw = acct.get("proxy")
+            self.proxy = normalize_proxy(raw)
+            if raw and not self.proxy:
+                await self._log(
+                    "warn",
+                    f"stored proxy for {self.email} is unusable, "
+                    f"falling back to pool",
+                )
+                self.proxy = await pick_proxy()
             self.reused_account = True
             await self._log("info", f"reusing account {self.email} (proxy={self.proxy or 'none'})")
         else:
@@ -552,14 +578,20 @@ class HiggsfieldCreator:
             self.proxy = await pick_proxy()
             self.reused_account = False
 
+        if not self.proxy:
+            await self._log("warn", "no usable proxies in pool — launching direct (no proxy)")
+
         proxy_info = PROXY_POOL.get_info(self.proxy) if self.proxy else None
         proxy_tz = proxy_info.timezone if proxy_info else "America/New_York"
-        proxy_udd = proxy_info.user_data_dir if proxy_info else None
 
         await self._log("info", f"launching browser (proxy={'yes' if self.proxy else 'no'}, pool={PROXY_POOL.size}, tz={proxy_tz})")
         self._pw = await async_playwright().start()
         launch_args = {"headless": HEADLESS, "args": list(BROWSER_ARGS)}
-        if self.proxy: launch_args["proxy"] = {"server": self.proxy}
+        if self.proxy:
+            # self.proxy is now guaranteed to be 'host:port:user:pass' or a
+            # credential-less socks5:// URL. Playwright auto-detects the
+            # scheme; for the plain form it treats it as HTTP.
+            launch_args["proxy"] = _playwright_proxy_dict(self.proxy)
         self.browser = await self._pw.chromium.launch(**launch_args)
         self.ctx = await self.browser.new_context(
             viewport=self.fp.resolution,
@@ -588,7 +620,6 @@ class HiggsfieldCreator:
         except Exception:
             await self._log("info", "signup: networkidle not reached within 15s, continuing")
 
-        # Acquire iframe-aware scope FIRST, then dismiss banner inside it if needed.
         scope = await self._form_scope("signup")
         await self._dismiss_cookie_banner(scope=scope)
 
@@ -601,7 +632,6 @@ class HiggsfieldCreator:
             await self._diagnose_page("captcha_signup")
             raise RuntimeError("captcha on signup - needs a solver or manual solve")
 
-        # All form interactions use `scope`, which may be a FrameLocator.
         await fill_any(scope, self.first, ['input[name="firstName"]', 'input[name="name"]',
             'input[placeholder*="first name" i]', 'input[placeholder*="name" i]'])
         await fill_any(scope, self.last, ['input[name="lastName"]', 'input[placeholder*="last name" i]'])
@@ -610,7 +640,6 @@ class HiggsfieldCreator:
         ok = await fill_any(scope, self.email, ['input[type="email"]', 'input[name="email"]',
             'input[placeholder*="mail" i]', 'input[placeholder*="email" i]'])
         if not ok:
-            # Last chance: re-scope, in case the iframe swapped during banner dismissal.
             scope = await self._form_scope("signup-retry")
             await self._dismiss_cookie_banner(scope=scope)
             ok = await fill_any(scope, self.email, ['input[type="email"]', 'input[name="email"]',
@@ -680,7 +709,6 @@ class HiggsfieldCreator:
         await click_any(scope, ['button[type="submit"]', 'button:has-text("Log in")',
             'button:has-text("Sign in")', 'button:has-text("Continue")'])
 
-        # Wait for navigation OUT of /login, or for the network to settle.
         try:
             await self.page.wait_for_function(
                 "() => !location.pathname.startsWith('/login')",
@@ -815,3 +843,36 @@ class HiggsfieldCreator:
         self.ctx = self.page = None
         if hasattr(self, "browser"): self.browser = None
         if hasattr(self, "_pw"): self._pw = None
+
+
+# ===== Playwright proxy dict helper =====
+# Playwright wants the proxy as {"server": "scheme://host:port",
+# "username": ..., "password": ...} for HTTP proxies. But Chromium cannot
+# do SOCKS5 auth, so for the plain host:port:user:pass form we convert to
+# an HTTP proxy with separate credentials.
+
+def _playwright_proxy_dict(proxy_str: str) -> dict:
+    """Convert a normalized proxy string into Playwright's proxy dict.
+
+    Accepts:
+      - "host:port:user:pass"     → HTTP proxy with auth
+      - "socks5://host:port"      → SOCKS5 without auth
+      - "http://host:port:u:p"    → HTTP proxy with auth
+    """
+    if "://" in proxy_str:
+        # Already a URL — pass as-is (only SOCKS5-without-auth should reach here)
+        return {"server": proxy_str}
+
+    parts = proxy_str.split(":")
+    if len(parts) == 4:
+        host, port, user, pw = parts
+        return {
+            "server": f"http://{host}:{port}",
+            "username": user,
+            "password": pw,
+        }
+    # host:port only
+    if len(parts) == 2:
+        return {"server": f"http://{parts[0]}:{parts[1]}"}
+    # Unexpected — hand it back to Playwright and let it error loudly
+    return {"server": proxy_str}
