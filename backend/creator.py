@@ -1,12 +1,13 @@
 """HiggsfieldCreator — full invisible automation of the Higgsfield Genjutsu flow.
 
-v4.0 anti-detection upgrades:
+v4.1 anti-detection upgrades:
   - Maximum fingerprint spoofing (canvas/WebGL/audio/navigator)
   - Human-like bezier mouse movements + typing simulation
   - Configurable long delays (30-90s between actions, 5-15min between accounts)
   - Rotating UA/timezone/language/screen resolution per session
   - Per-proxy rate limiting (max 2-3 accounts/hour per IP)
   - Stealth init scripts (webdriver, plugins, languages, hardware)
+  - iframe-aware form scope resolution (Higgsfield renders auth in an iframe)
 
 Bug fixes vs prior version:
   A: mark_used() fires right after generation (before download) — no credit leak.
@@ -16,11 +17,12 @@ Bug fixes vs prior version:
   E: TempMail log callback is now properly awaited (no fire-and-forget).
   F: overall timeout wraps the entire retry loop (configurable via RUN_TIMEOUT).
   G: proxy is bound to the account at creation and reused on every login.
+  H: iframe-based signup/login forms now reachable via FrameLocator.
 """
 import os, asyncio, random, logging, string as _string, math, time
 from typing import Optional, Callable, Awaitable
 from pathlib import Path
-from playwright.async_api import async_playwright, Page, BrowserContext, Locator
+from playwright.async_api import async_playwright, Page, BrowserContext, Locator, FrameLocator
 from temp_mail import TempMail
 from database import save_account, get_account_with_credits, mark_used, mark_banned
 from proxy_manager import ProxyManager, load_proxy_list, COOLDOWN_SECONDS
@@ -37,10 +39,7 @@ PROXY_LIST = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.str
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "900"))
 
-# Container-safe Chromium flags. Inside Docker (Render/Railway/Fly) Chromium
-# will not start without --no-sandbox (no user namespaces for root) and it
-# crashes randomly without --disable-dev-shm-usage (/dev/shm is only 64 MB).
-# The remaining flags cap renderer memory so a 512 MB instance survives.
+# Container-safe Chromium flags.
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
@@ -59,24 +58,17 @@ BROWSER_ARGS = [
 ]
 
 # --- Anti-detection config (v4.1 — mass mode, no throttling) ---
-# Natural human-like delays (fast but not robotic)
 MIN_ACTION_DELAY = float(os.getenv("MIN_ACTION_DELAY", "0.5"))
 MAX_ACTION_DELAY = float(os.getenv("MAX_ACTION_DELAY", "2.0"))
-# No cooldown, no per-IP limit — mass account creation
-STEALTH_MODE = False  # always fast mode
+STEALTH_MODE = False
 
-
-# ProxyPool was removed: ProxyManager (proxy_manager.py) is the single source of
-# truth for rotation, cooldowns and failure tracking. Two competing pools with
-# different signatures was the source of several import-time failures.
 PROXY_POOL = ProxyManager(load_proxy_list())
 
-# Global delay between new account creations (90-180s)
 GLOBAL_ACCOUNT_DELAY = float(os.getenv("GLOBAL_ACCOUNT_DELAY", "90"))
 _last_account_time = 0.0
 
 
-# ===== FingerprintRandomizer — maximum spoofing per session =====
+# ===== FingerprintRandomizer =====
 
 USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -91,7 +83,6 @@ PLATFORMS = ["MacIntel","Win32","Linux x86_64"]
 
 
 class FingerprintRandomizer:
-    """Generates a unique fingerprint profile for each browser session."""
     def __init__(self):
         self.ua = random.choice(USER_AGENTS)
         self.timezone = random.choice(TIMEZONES)
@@ -130,7 +121,7 @@ class FingerprintRandomizer:
         """
 
 
-# ===== HumanInput — realistic mouse + keyboard simulation =====
+# ===== HumanInput =====
 
 class HumanInput:
     @staticmethod
@@ -178,7 +169,6 @@ class HumanInput:
 
 
 async def human_delay(lo=None, hi=None):
-    """Fast natural human-like delay (0.5-2s). Not robotic, not throttled."""
     if lo is not None and hi is not None:
         await asyncio.sleep(random.uniform(lo, hi))
     else:
@@ -188,7 +178,6 @@ async def pick_proxy() -> Optional[str]:
     return await PROXY_POOL.next()
 
 async def global_account_delay():
-    """Global delay of 90-180s between starting new account creations."""
     global _last_account_time
     if GLOBAL_ACCOUNT_DELAY > 0:
         elapsed = time.time() - _last_account_time
@@ -208,6 +197,11 @@ def random_name() -> tuple[str, str]:
 
 
 async def click_any(scope, selectors, timeout=15000) -> bool:
+    """Click first matching selector within scope.
+
+    `scope` may be a Page, Frame, or FrameLocator. All three expose
+    .locator(), so this works uniformly.
+    """
     for sel in selectors:
         try:
             loc = scope.locator(sel).first
@@ -218,6 +212,7 @@ async def click_any(scope, selectors, timeout=15000) -> bool:
     return False
 
 async def fill_any(scope, value, selectors, timeout=15000) -> bool:
+    """Fill first matching selector within scope. Same scope rules as click_any."""
     for sel in selectors:
         try:
             loc = scope.locator(sel).first
@@ -227,10 +222,10 @@ async def fill_any(scope, value, selectors, timeout=15000) -> bool:
             continue
     return False
 
-async def wait_any(page, selectors, timeout=30000) -> bool:
+async def wait_any(scope, selectors, timeout=30000) -> bool:
     for sel in selectors:
         try:
-            if await page.locator(sel).first.wait_for(state="visible", timeout=timeout):
+            if await scope.locator(sel).first.wait_for(state="visible", timeout=timeout):
                 return True
         except Exception:
             continue
@@ -249,7 +244,6 @@ async def detect_captcha(page) -> bool:
 
 
 async def _find_settings_scope(page) -> Locator:
-    """Bug D fix: return the best settings container, or page root as fallback."""
     containers = ['[role="dialog"]', '[aria-modal="true"]', '.settings-panel',
                   '.modal', '[class*="settings" i]', 'main', 'body']
     for c in containers:
@@ -312,8 +306,8 @@ class HiggsfieldCreator:
         self.ctx = None; self.page = None
         self.proxy: Optional[str] = None
         self.reused_account = False
-        self.fp = FingerprintRandomizer()  # v4.0: unique fingerprint per session
-        self.hi = HumanInput()              # v4.0: human-like input
+        self.fp = FingerprintRandomizer()
+        self.hi = HumanInput()
 
     async def _log(self, level, msg):
         log.info(f"[{level}] {msg}")
@@ -328,7 +322,6 @@ class HiggsfieldCreator:
             pass
 
     async def _detect_cloudflare(self) -> bool:
-        """Detect Cloudflare challenge/turnstile pages."""
         cf_sels = [
             'text="Checking your browser"',
             'text="Just a moment"',
@@ -348,11 +341,11 @@ class HiggsfieldCreator:
         return False
 
     async def _diagnose_page(self, tag: str) -> None:
-        """Log what is actually on the page.
+        """Log what is actually on the page, including per-frame contents.
 
-        "field not found" is useless on its own — it could be a Cloudflare
-        interstitial, a moved route, or a client-rendered SPA that has not
-        mounted yet. This records enough to tell those apart from the log alone.
+        `inputs=0 iframes=1` was previously indistinguishable from a blank
+        page. Now we walk every frame and report its URL and input count,
+        which immediately reveals whether the form lives in an iframe.
         """
         try:
             title = await self.page.title()
@@ -367,17 +360,29 @@ class HiggsfieldCreator:
                 f"inputs={n_inputs} textareas={n_textareas} iframes={n_iframes}",
             )
             await self._log("info", f"{tag}: body starts {body!r}")
-        except Exception as exc:  # noqa: BLE001 - diagnostics must never raise
+            # Per-frame diagnostics — this is what was missing before.
+            for i, frame in enumerate(self.page.frames):
+                if frame == self.page.main_frame:
+                    continue
+                try:
+                    fu = (frame.url or "")[:120]
+                    fi = await frame.locator("input").count()
+                    ft = await frame.locator("textarea").count()
+                    await self._log(
+                        "info",
+                        f"{tag}: frame[{i}] url={fu} inputs={fi} textareas={ft}",
+                    )
+                except Exception as fexc:
+                    await self._log("info", f"{tag}: frame[{i}] unreadable: {fexc}")
+        except Exception as exc:
             await self._log("warn", f"{tag}: could not inspect page: {exc}")
 
-    async def _dismiss_cookie_banner(self) -> bool:
-        """Accept the cookie notice so the real UI renders.
+    async def _dismiss_cookie_banner(self, scope=None) -> bool:
+        """Accept the cookie notice. Checks both page root and iframe scope.
 
-        Higgsfield gates the page behind a consent dialog. Until it is
-        dismissed the DOM contains zero inputs and the body text is nothing but
-        the notice — which is exactly the state that produced
-        "email field not found on signup" with a valid URL and no Cloudflare
-        challenge.
+        Higgsfield has served the consent dialog both at the top level and,
+        more recently, inside the same iframe as the auth form. Checking both
+        keeps this working regardless of where it is.
         """
         sels = [
             'button:has-text("Accept all")',
@@ -390,27 +395,96 @@ class HiggsfieldCreator:
             'button:has-text("Got it")',
             'button:has-text("Accept")',
         ]
-        for sel in sels:
-            try:
-                loc = self.page.locator(sel).first
-                if await loc.is_visible(timeout=1500):
-                    await loc.click()
-                    await human_delay(0.6, 1.4)
-                    await self._log("ok", f"dismissed cookie banner ({sel})")
-                    return True
-            except Exception:
-                continue
+        scopes = [self.page]
+        if scope is not None and scope is not self.page:
+            scopes.append(scope)
+        for s in scopes:
+            for sel in sels:
+                try:
+                    loc = s.locator(sel).first
+                    if await loc.is_visible(timeout=1000):
+                        await loc.click()
+                        await human_delay(0.6, 1.4)
+                        await self._log("ok", f"dismissed cookie banner ({sel})")
+                        return True
+                except Exception:
+                    continue
         return False
 
     async def _human_scroll(self, scrolls=3):
-        """Simulate human scrolling — scroll down and up randomly."""
         for _ in range(scrolls):
             await self.page.mouse.wheel(0, random.randint(100, 400))
             await asyncio.sleep(random.uniform(0.5, 2.0))
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
+    async def _form_scope(self, tag: str = "form"):
+        """Return a scope capable of seeing the signup/login form.
+
+        Higgsfield's auth form is rendered inside a cross-origin iframe.
+        `page.locator()` cannot cross that boundary; `page.frame_locator()`
+        can. This picks the first iframe that actually contains an <input>,
+        which distinguishes the form iframe from analytics/Cloudflare iframes.
+
+        Returns:
+            A FrameLocator if a form iframe was found, otherwise the Page.
+        """
+        # Give late-mounted iframes a chance.
+        try:
+            await self.page.wait_for_selector("iframe", timeout=15000)
+        except Exception:
+            await self._log("warn", f"{tag}: no iframe appeared within 15s")
+
+        # Prefer selectors that name common auth providers, in case the
+        # page ever has multiple iframes.
+        candidates = [
+            'iframe[src*="auth"]',
+            'iframe[src*="signup"]',
+            'iframe[src*="login"]',
+            'iframe[src*="clerk"]',
+            'iframe[src*="auth0"]',
+            'iframe[src*="supabase"]',
+            'iframe[src*="higgsfield"]',
+            'iframe[title*="Sign" i]',
+            'iframe[title*="auth" i]',
+            'iframe[title*="login" i]',
+            'iframe',
+        ]
+        for sel in candidates:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                fl = self.page.frame_locator(sel).first
+                # Sanity check: does this frame actually contain inputs?
+                try:
+                    n = await fl.locator("input").count()
+                except Exception:
+                    n = 0
+                if n > 0:
+                    await self._log("info", f"{tag}: scope=frame({sel}) inputs={n}")
+                    return fl
+            except Exception:
+                continue
+
+        # Fallback: iterate raw frames (handles nested / unlabeled iframes)
+        for i, frame in enumerate(self.page.frames):
+            if frame == self.page.main_frame:
+                continue
+            try:
+                n = await frame.locator("input").count()
+                if n > 0:
+                    await self._log(
+                        "info",
+                        f"{tag}: scope=frame[{i}] url={(frame.url or '')[:80]} inputs={n}",
+                    )
+                    return frame
+            except Exception:
+                continue
+
+        await self._log("info", f"{tag}: scope=page (no iframe with inputs found)")
+        return self.page
+
     async def run(self, reference_path, prompt, image_paths: list[Path] | None = None) -> Path:
-        # Gap F: overall timeout wraps the entire retry loop
         self._image_paths = image_paths or []
         try:
             return await asyncio.wait_for(
@@ -432,13 +506,11 @@ class HiggsfieldCreator:
             except Exception as e:
                 last_err = e
                 await self._log("warn", f"attempt {attempt} failed: {e}")
-                # Record proxy failure + release with backoff
                 if self.proxy and not self.reused_account:
                     await PROXY_POOL.record_failure(self.proxy)
                     await self._log("info", f"proxy {self.proxy.split('@')[0]}@*** marked failed, will retry with different proxy")
                 if self.page: await self._shot(f"fail_attempt{attempt}")
                 await self._cleanup()
-                # Backoff: exponential delay between retries
                 backoff = min(60 * (2 ** (attempt - 1)), 180)
                 await self._log("info", f"backoff: sleeping {backoff}s before retry")
                 await asyncio.sleep(backoff)
@@ -453,11 +525,10 @@ class HiggsfieldCreator:
             self.reused_account = True
             await self._log("info", f"reusing account {self.email} (proxy={self.proxy or 'none'})")
         else:
-            await global_account_delay()  # 90-180s between new account creations
+            await global_account_delay()
             self.proxy = await pick_proxy()
             self.reused_account = False
 
-        # Get proxy metadata for timezone matching
         proxy_info = PROXY_POOL.get_info(self.proxy) if self.proxy else None
         proxy_tz = proxy_info.timezone if proxy_info else "America/New_York"
         proxy_udd = proxy_info.user_data_dir if proxy_info else None
@@ -480,8 +551,6 @@ class HiggsfieldCreator:
             await self._create_account()
         await self._login()
         await self._run_genjutsu(reference_path, prompt)
-        # Bug A fix: mark credit consumed RIGHT AFTER generation succeeds,
-        # before the failure-prone download step. No credit leak on download error.
         await mark_used(self.email, 0)
         await self._log("ok", f"account {self.email} marked used (credits=0)")
         return await self._download_result()
@@ -489,16 +558,17 @@ class HiggsfieldCreator:
     async def _create_account(self):
         self.email = await self.mail.create()
         await self._log("info", f"temp inbox ready: {self.email}")
-        await self.page.goto(SIGNUP, wait_until="domcontentloaded", timeout=90000); await human_delay()
-        # The site is a client-rendered SPA: domcontentloaded fires before React
-        # has mounted the form. Best-effort wait, but never hang on it.
+        await self.page.goto(SIGNUP, wait_until="domcontentloaded", timeout=90000)
+        await human_delay()
         try:
             await self.page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             await self._log("info", "signup: networkidle not reached within 15s, continuing")
-        # The consent dialog covers the form until accepted.
-        await self._dismiss_cookie_banner()
-        # Cloudflare detection
+
+        # Acquire iframe-aware scope FIRST, then dismiss banner inside it if needed.
+        scope = await self._form_scope("signup")
+        await self._dismiss_cookie_banner(scope=scope)
+
         if await self._detect_cloudflare():
             await self._shot("cloudflare_signup")
             await self._diagnose_page("cloudflare_signup")
@@ -507,34 +577,38 @@ class HiggsfieldCreator:
             await self._shot("captcha_signup")
             await self._diagnose_page("captcha_signup")
             raise RuntimeError("captcha on signup - needs a solver or manual solve")
-        await fill_any(self.page, self.first, ['input[name="firstName"]', 'input[name="name"]',
+
+        # All form interactions use `scope`, which may be a FrameLocator.
+        await fill_any(scope, self.first, ['input[name="firstName"]', 'input[name="name"]',
             'input[placeholder*="first name" i]', 'input[placeholder*="name" i]'])
-        await fill_any(self.page, self.last, ['input[name="lastName"]', 'input[placeholder*="last name" i]'])
+        await fill_any(scope, self.last, ['input[name="lastName"]', 'input[placeholder*="last name" i]'])
         await human_delay()
-        ok = await fill_any(self.page, self.email, ['input[type="email"]', 'input[name="email"]',
+
+        ok = await fill_any(scope, self.email, ['input[type="email"]', 'input[name="email"]',
             'input[placeholder*="mail" i]', 'input[placeholder*="email" i]'])
         if not ok:
-            # If the banner appeared late it can still be covering the form.
-            if await self._dismiss_cookie_banner():
-                ok = await fill_any(self.page, self.email, ['input[type="email"]', 'input[name="email"]',
-                    'input[placeholder*="mail" i]', 'input[placeholder*="email" i]'])
+            # Last chance: re-scope, in case the iframe swapped during banner dismissal.
+            scope = await self._form_scope("signup-retry")
+            await self._dismiss_cookie_banner(scope=scope)
+            ok = await fill_any(scope, self.email, ['input[type="email"]', 'input[name="email"]',
+                'input[placeholder*="mail" i]', 'input[placeholder*="email" i]'])
         if not ok:
             await self._shot("signup_no_email_field")
             await self._diagnose_page("signup_no_email_field")
             raise RuntimeError("email field not found on signup (see diagnose line above)")
+
         await human_delay()
-        ok = await fill_any(self.page, self.password, ['input[type="password"]', 'input[name="password"]',
+        ok = await fill_any(scope, self.password, ['input[type="password"]', 'input[name="password"]',
             'input[placeholder*="password" i]'])
         if not ok: raise RuntimeError("password field not found on signup")
         await human_delay()
-        await click_any(self.page, ['input[type="checkbox"]', '[role="checkbox"]'], timeout=3000)
-        ok = await click_any(self.page, ['button[type="submit"]', 'button:has-text("Sign up")',
+        await click_any(scope, ['input[type="checkbox"]', '[role="checkbox"]'], timeout=3000)
+        ok = await click_any(scope, ['button[type="submit"]', 'button:has-text("Sign up")',
             'button:has-text("Create")', 'button:has-text("Register")', 'button:has-text("Continue")',
             'button:has-text("Get started")'])
         if not ok: raise RuntimeError("signup submit button not found")
         await self._log("info", "signup form submitted")
         await self._log("info", "waiting for verification email...")
-        # Bug E fix: async callback, properly awaited inside TempMail.wait_for_link
         link = await self.mail.wait_for_link(log=lambda m: self._log("info", m))
         await self._log("ok", f"verification link: {link}")
         await self.page.goto(link, wait_until="domcontentloaded", timeout=60000); await human_delay()
@@ -542,35 +616,68 @@ class HiggsfieldCreator:
             await self._shot("captcha_verify")
             raise RuntimeError("captcha on verification - needs a solver or manual solve")
         await self._log("ok", "email verified")
-        # Gap G: bind proxy used at signup to this account
         await save_account(self.email, self.password, credits=1, proxy=self.proxy)
         await self._log("ok", f"account saved (proxy bound: {self.proxy or 'none'})")
-        # Mark proxy as used (triggers 45 min cooldown)
         if self.proxy:
             await PROXY_POOL.mark_used(self.proxy)
 
     async def _login(self):
-        await self.page.goto(LOGIN, wait_until="domcontentloaded", timeout=60000); await human_delay()
+        await self.page.goto(LOGIN, wait_until="domcontentloaded", timeout=60000)
+        await human_delay()
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+
+        scope = await self._form_scope("login")
+        await self._dismiss_cookie_banner(scope=scope)
+
         if await detect_captcha(self.page):
             await self._shot("captcha_login")
             raise RuntimeError("captcha on login - needs a solver or manual solve")
-        await fill_any(self.page, self.email, ['input[type="email"]', 'input[name="email"]',
-            'input[placeholder*="email" i]'])
+
+        ok = await fill_any(scope, self.email, ['input[type="email"]', 'input[name="email"]',
+            'input[placeholder*="email" i]', 'input[placeholder*="mail" i]'])
+        if not ok:
+            scope = await self._form_scope("login-retry")
+            ok = await fill_any(scope, self.email, ['input[type="email"]', 'input[name="email"]',
+                'input[placeholder*="email" i]', 'input[placeholder*="mail" i]'])
+        if not ok:
+            await self._shot("login_no_email_field")
+            await self._diagnose_page("login_no_email_field")
+            raise RuntimeError("email field not found on login")
+
         await human_delay()
-        await fill_any(self.page, self.password, ['input[type="password"]', 'input[name="password"]'])
-        await click_any(self.page, ['button[type="submit"]', 'button:has-text("Log in")',
-            'button:has-text("Sign in")'])
-        await self.page.wait_for_load_state("networkidle")
-        # Bug B fix: verify login succeeded; mark reused account banned if it failed
+        ok = await fill_any(scope, self.password, ['input[type="password"]', 'input[name="password"]'])
+        if not ok:
+            await self._shot("login_no_password_field")
+            await self._diagnose_page("login_no_password_field")
+            raise RuntimeError("password field not found on login")
+
+        await click_any(scope, ['button[type="submit"]', 'button:has-text("Log in")',
+            'button:has-text("Sign in")', 'button:has-text("Continue")'])
+
+        # Wait for navigation OUT of /login, or for the network to settle.
+        try:
+            await self.page.wait_for_function(
+                "() => !location.pathname.startsWith('/login')",
+                timeout=30000,
+            )
+        except Exception:
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+
         if "/login" in self.page.url:
             if self.reused_account:
                 await mark_banned(self.email)
                 await self._log("warn", f"account {self.email} marked BANNED (login failed)")
+            await self._diagnose_page("login_still_on_login")
             raise RuntimeError("login failed - still on /login (bad creds or banned)")
         await self._log("ok", "logged in")
 
     async def _run_genjutsu(self, reference_path, prompt):
-        # Bug C fix: use HTTP response status for 404 detection
         resp = await self.page.goto(CREATE, wait_until="domcontentloaded", timeout=60000)
         if resp and resp.status >= 400:
             await self._log("info", f"/create returned {resp.status}, falling back to /genjutsu")
@@ -580,7 +687,6 @@ class HiggsfieldCreator:
         if await detect_captcha(self.page):
             await self._shot("captcha_create")
             raise RuntimeError("captcha on create page - needs a solver or manual solve")
-        # Human behavior: scroll the page before interacting
         await self._human_scroll(scrolls=random.randint(2, 4))
         await self._log("info", "selecting Model: Higgsfield Genjutsu")
         await select_menu_option(self.page, "Model", "Higgsfield Genjutsu", self._log)
@@ -591,10 +697,8 @@ class HiggsfieldCreator:
         await self._log("info", "ensuring 'Use free gens' is ON")
         await ensure_toggle_on(self.page, "Use free gens", self._log)
         await human_delay()
-        # Human behavior: wait 15-40s before uploading reference (like a human reading the page)
         await self._log("info", "waiting before upload (human simulation)...")
         await asyncio.sleep(random.uniform(15, 40))
-        # Upload reference VIDEO (required) — find the video file input
         file_inputs = self.page.locator('input[type="file"]')
         count = await file_inputs.count()
         await self._log("info", f"found {count} file input(s) on create page")
@@ -611,12 +715,10 @@ class HiggsfieldCreator:
                 except Exception:
                     continue
         if not video_uploaded:
-            # fallback: first file input
             await file_inputs.first.set_input_files(reference_path)
             await self._log("info", "reference video uploaded (fallback to first input)")
         await human_delay(1, 2)
 
-        # Upload reference IMAGES (optional, up to 30) — find the image file input
         if self._image_paths:
             img_uploaded = False
             for i in range(count):
@@ -631,7 +733,6 @@ class HiggsfieldCreator:
                     except Exception:
                         continue
             if not img_uploaded and count > 1:
-                # try the second input (first was video)
                 try:
                     await file_inputs.nth(1).set_input_files([str(p) for p in self._image_paths])
                     await self._log("info", f"{len(self._image_paths)} reference image(s) uploaded (input #1)")
